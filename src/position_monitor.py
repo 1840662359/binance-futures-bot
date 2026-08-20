@@ -24,6 +24,7 @@ import math
 import queue
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
@@ -35,6 +36,7 @@ from detect_box_consolidation import parse_candles
 from fetch_klines_for_symbols import fetch_klines_with_failures
 from logging_utils import get_logger
 from pnl_tracker import append_pnl_record
+from position_lifecycle import add_event, create_lifecycle, read_lifecycle, remove_lifecycle
 from scheduler import SchedulerConfig
 from secret_utils import get_secret
 from websocket_streams import MarkPriceStream, UserDataStream
@@ -383,6 +385,9 @@ class PositionMonitor:
         if kind == "account":
             # 私有流只负责发现变动；状态写入必须等待 REST 权威快照确认。
             self._account_reconcile_due = time.monotonic() + ACCOUNT_EVENT_DEBOUNCE_SECONDS
+        elif kind == "order_event":
+            self._capture_lifecycle_event(payload)
+            self._queue.put(("snapshot", None))
         elif kind == "mark":
             key = str(payload)
             task = self._trail_tasks.get(key)
@@ -405,9 +410,8 @@ class PositionMonitor:
         if event_type == "ACCOUNT_UPDATE":
             self._queue.put(("account", payload))
         elif event_type in {"ORDER_TRADE_UPDATE", "ALGO_UPDATE"}:
-            # 订单/条件单状态变更及 listenKey 失效均要求用 REST 完整对账；
-            # 不依据网络事件缺失直接清理程序仓位。
-            self._queue.put(("snapshot", None))
+            # 先持久化程序订单/条件单事实，再以 REST 确认仓位真实变动。
+            self._queue.put(("order_event", payload))
         elif event_type == "listenKeyExpired":
             self._queue.put(("listen_key_expired", None))
 
@@ -419,6 +423,66 @@ class PositionMonitor:
 
     def _on_mark_stream_connection(self, connected: bool) -> None:
         self._mark_stream_connected = connected
+
+    def _capture_lifecycle_event(self, payload: dict[str, Any]) -> None:
+        """将私有流中的程序平仓事实写入生命周期账本。
+
+        只有仍在 program_positions.json 中的 key 才会被记录，因此人工仓、
+        外部仓位以及未登记仓位不会进入盈亏统计。
+        """
+        event_type = str(payload.get("e") or "")
+        order = payload.get("o") or payload.get("ao")
+        if not isinstance(order, dict):
+            return
+        symbol = order.get("s") or order.get("symbol")
+        position_side = str(order.get("ps") or order.get("positionSide") or "BOTH")
+        if not isinstance(symbol, str):
+            return
+        key = position_key(symbol, position_side)
+        position = self._find_position_by_key(key)
+        if position is None:
+            return
+        if event_type == "ALGO_UPDATE":
+            algo_id = order.get("i") or order.get("algoId")
+            status = str(order.get("X") or order.get("algoStatus") or "")
+            if str(algo_id) != str(position.get("stopAlgoId")) or status != "TRIGGERED":
+                return
+            add_event(self.config.environment, key, {
+                "eventId": f"algo:{algo_id}:{status}:{payload.get('E')}",
+                "eventType": event_type, "eventTime": payload.get("E"),
+                "algoId": algo_id, "closeReason": "程序止损",
+                "evidence": "程序登记的止损 Algo Order 已触发",
+            })
+            return
+        if event_type != "ORDER_TRADE_UPDATE":
+            return
+        execution_type = str(order.get("x") or "")
+        status = str(order.get("X") or "")
+        if execution_type != "TRADE" and status != "FILLED":
+            return
+        order_side = str(order.get("S") or order.get("side") or "")
+        is_long = str(position.get("direction") or "") == "多"
+        closing_side = "SELL" if is_long else "BUY"
+        if order_side != closing_side:
+            return
+        order_id = order.get("i") or order.get("orderId")
+        client_order_id = order.get("c") or order.get("clientOrderId")
+        reason = "外部平仓"
+        evidence = "成交订单不属于已登记的程序止盈、止损或自动全平订单"
+        if str(order_id) == str(position.get("takeProfitOrderId")):
+            reason, evidence = "程序止盈", "成交订单与程序登记的止盈订单 ID 一致"
+        elif str(order_id) == str(position.get("autoCloseOrderId")) or (
+            client_order_id and client_order_id == position.get("autoCloseClientOrderId")
+        ):
+            reason, evidence = "程序盈亏全平", "成交订单与程序生成的自动全平订单一致"
+        add_event(self.config.environment, key, {
+            "eventId": f"order:{order_id}:{order.get('t')}:{payload.get('E')}",
+            "eventType": event_type, "eventTime": payload.get("E"),
+            "orderId": order_id, "clientOrderId": client_order_id,
+            "tradeId": order.get("t"), "realizedPnl": order.get("rp"),
+            "commission": order.get("n"), "commissionAsset": order.get("N"),
+            "closeReason": reason, "evidence": evidence,
+        })
 
     def _recreate_user_stream(self) -> None:
         """listenKey 失效后重建私有流；旧 key 不可无限重连使用。"""
@@ -475,62 +539,6 @@ class PositionMonitor:
                     self._queue.put(("mark", key))
 
     # ---- 对齐 ----
-
-    def _apply_account_update(self, payload: dict[str, Any]) -> None:
-        """用 ACCOUNT_UPDATE 事件更新账户快照(余额 B 数组 + 持仓明细 P 数组)。"""
-        account = payload.get("a")
-        if not isinstance(account, dict):
-            return
-        balances = account.get("B")
-        if isinstance(balances, list):
-            for item in balances:
-                if not isinstance(item, dict):
-                    continue
-                asset = item.get("a")
-                try:
-                    wallet = float(item.get("wb"))
-                    available = float(item.get("cw"))
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(asset, str) and math.isfinite(wallet) and math.isfinite(available):
-                    previous = self._account_balances.get(asset, {})
-                    self._account_balances[asset] = {
-                        "balance": wallet,
-                        "availableBalance": available,
-                        "unrealizedProfit": previous.get("unrealizedProfit", 0.0),
-                    }
-        positions = account.get("P")
-        if isinstance(positions, list):
-            for item in positions:
-                if not isinstance(item, dict):
-                    continue
-                symbol = item.get("s")
-                try:
-                    amount = float(item.get("pa"))
-                    entry = float(item.get("ep"))
-                    unrealized = float(item.get("up"))
-                except (TypeError, ValueError):
-                    continue
-                side = str(item.get("ps") or "BOTH")
-                if not isinstance(symbol, str) or not math.isfinite(amount):
-                    continue
-                key = position_key(symbol, side)
-                quantity = _decimal_of(item.get("pa")) or Decimal("0")
-                # ACCOUNT_UPDATE 只推送发生变化的方向，不能把未出现的另一方向归零。
-                self._exchange_positions[key] = amount
-                self._exchange_position_strs[key] = quantity
-                previous = self._account_positions.get(key, {})
-                self._account_positions[key] = {
-                    "symbol": symbol,
-                    "positionSide": side,
-                    "positionAmt": amount,
-                    "positionAmtStr": format(quantity, "f"),
-                    "entryPrice": entry if math.isfinite(entry) else previous.get("entryPrice", 0.0),
-                    "markPrice": previous.get("markPrice", 0.0),
-                    "unrealizedProfit": unrealized if math.isfinite(unrealized) else previous.get("unrealizedProfit", 0.0),
-                    "leverage": previous.get("leverage", 1),
-                }
-        self._snapshot_updated_at = time.monotonic()
 
     def _full_snapshot(self) -> None:
         """positionRisk 全量快照覆盖持仓状态,并触发对齐(断线/丢事件兜底)。"""
@@ -614,6 +622,8 @@ class PositionMonitor:
         """对齐:本地有而交易所无的仓位视为幽灵,清理本地并取消残留挂单。"""
         for position in load_positions(self.config.environment):
             key = position_key(position.get("symbol"), position.get("positionSide"))
+            # 兼容已存在的旧程序持仓：首次看到时补建生命周期账本。
+            create_lifecycle(self.config.environment, {**position, "positionKey": key})
             amount = self._exchange_positions.get(key)
             expected = _decimal_of(position.get("quantity"))
             # 本轮完整 V3 快照成功后，未返回该键等同该方向无持仓；查询失败时本函数不会执行。
@@ -690,23 +700,27 @@ class PositionMonitor:
             self.logger.warning("平仓盈亏记录失败,保留本地记录待下轮重试 symbol=%s: %s", symbol, exc)
             return
         remove_position(self.config.environment, symbol, str(position.get("positionSide") or "BOTH"))
+        remove_lifecycle(self.config.environment, position_key(symbol, position.get("positionSide")))
         self.logger.info("幽灵持仓已清理 symbol=%s", symbol)
 
     def _record_position_pnl(self, position: dict[str, Any], tp_missing: bool, stop_missing: bool) -> None:
-        """平仓盈亏统计:按开仓信息查询交易所已实现盈亏并记录到本地盈亏目录。
-
-        任何形式的平仓(止损/止盈/手动)都会让仓位从交易所消失,经对齐发现后
-        在此记录;仅统计程序开出的单(本地台账记录的开仓信息)。
-        """
+        """按程序仓位生命周期汇总最终平仓盈亏与原因。"""
         symbol = str(position.get("symbol") or "")
         open_time = position.get("openTime")
         if not symbol:
             return
-        realized, commission = self._query_realized_pnl(symbol, open_time)
+        key = position_key(symbol, position.get("positionSide"))
+        lifecycle = read_lifecycle(self.config.environment, key) or {}
+        close_time = int(time.time() * 1000)
+        realized, commission, funding, commission_by_asset, exit_order_ids = self._query_lifecycle_pnl(
+            symbol, open_time, close_time, str(position.get("direction") or ""),
+            str(position.get("positionSide") or "BOTH"),
+        )
         quantity = position.get("quantity")
         if quantity is None:
             quantity = self._ledger_quantity(symbol, open_time)
         record = {
+            "positionKey": key,
             "symbol": symbol,
             "signalType": position.get("signalType"),
             "direction": position.get("direction"),
@@ -714,11 +728,17 @@ class PositionMonitor:
             "quantity": quantity,
             "leverage": position.get("leverage"),
             "openTime": open_time,
-            "closeTime": int(time.time() * 1000),
+            "closeTime": close_time,
             "realizedPnlUsdt": realized,
             "commissionUsdt": commission,
-            "netPnlUsdt": realized + commission,
-            "closeReason": self._detect_close_reason(position, tp_missing, stop_missing),
+            "fundingFeeUsdt": funding,
+            "commissionByAsset": commission_by_asset,
+            "netPnlUsdt": realized + commission + funding,
+            "closeReason": self._resolve_close_reason(position, lifecycle, tp_missing, stop_missing),
+            "closeReasonEvidence": lifecycle.get("closeReasonEvidence"),
+            "entryOrderId": position.get("entryOrderId") or lifecycle.get("entryOrderId"),
+            "exitOrderIds": exit_order_ids,
+            "lifecycleEvents": lifecycle.get("events", []),
             "recordedAt": datetime.now(timezone.utc).isoformat(),
         }
         append_pnl_record(self.config.environment, record)
@@ -748,47 +768,74 @@ class PositionMonitor:
         except Exception:
             self.logger.exception("平仓通知推送失败")
 
-    def _query_realized_pnl(self, symbol: str, open_time: Any) -> tuple[float, float]:
-        """查询交易对自开仓以来的已实现盈亏与手续费(/fapi/v1/income)。
-
-        返回 (realized, commission);income 记录按实际成交结算,为权威盈亏来源。
-        """
+    def _query_lifecycle_pnl(
+        self, symbol: str, open_time: Any, close_time: int, direction: str, position_side: str
+    ) -> tuple[float, float, float, dict[str, float], list[int]]:
+        """只汇总本程序持仓从实际开仓到最终平仓期间的成交与资金费。"""
         try:
             start = int(open_time)
         except (TypeError, ValueError):
             start = int(time.time() * 1000) - 7 * 86400_000
-        end = int(time.time() * 1000)
         realized = 0.0
         commission = 0.0
-        for income_type in ("REALIZED_PNL", "COMMISSION"):
-            for item in self._client.get_income(symbol, start, end, income_type):
+        commission_by_asset: dict[str, float] = {}
+        exit_order_ids: list[int] = []
+        trades = self._client.get_user_trades(symbol, start, close_time)
+        for trade in trades:
+            trade_side = str(trade.get("positionSide") or "BOTH")
+            if position_side != "BOTH" and trade_side != position_side:
+                continue
+            try:
+                realized += float(trade.get("realizedPnl", 0.0))
+            except (TypeError, ValueError):
+                pass
+            asset = str(trade.get("commissionAsset") or "USDT")
+            try:
+                fee = float(trade.get("commission", 0.0))
+            except (TypeError, ValueError):
+                fee = 0.0
+            commission_by_asset[asset] = commission_by_asset.get(asset, 0.0) + fee
+            if asset == "USDT":
+                commission += fee
+            closing_side = "SELL" if direction == "多" else "BUY"
+            if str(trade.get("side") or "") == closing_side:
                 try:
-                    value = float(item.get("income", 0.0))
+                    order_id = int(trade.get("orderId"))
                 except (TypeError, ValueError):
                     continue
-                if income_type == "REALIZED_PNL":
-                    realized += value
-                else:
-                    commission += value
-        return realized, commission
+                if order_id not in exit_order_ids:
+                    exit_order_ids.append(order_id)
+        # 用户成交明细暂不可用时，回退收入历史；仍仅由已登记程序仓位触发。
+        if not trades:
+            for item in self._client.get_income(symbol, start, close_time, "REALIZED_PNL"):
+                realized += _safe_float(item.get("income"))
+            for item in self._client.get_income(symbol, start, close_time, "COMMISSION"):
+                fee = _safe_float(item.get("income"))
+                commission += fee
+                commission_by_asset["USDT"] = commission_by_asset.get("USDT", 0.0) + fee
+        # funding fee 不会出现在 userTrades，单独以收入历史补入。
+        funding = sum(
+            _safe_float(item.get("income"))
+            for item in self._client.get_income(symbol, start, close_time, "FUNDING_FEE")
+        )
+        return realized, commission, funding, commission_by_asset, exit_order_ids
 
-    def _detect_close_reason(self, position: dict[str, Any], tp_missing: bool, stop_missing: bool) -> str:
-        """推断平仓原因:以挂单状态为准,避免手动平仓被误判为止损/止盈。
-
-        判定顺序:
-        1. 止盈限价单被消费且状态 FILLED → 止盈;
-        2. 止损条件单被消费且状态 TRIGGERED(已触发)→ 止损;
-        3. 两者均未触发(含手动平仓联动取消挂单)→ 手动平仓。
-        止损触发时交易所会联动取消止盈挂单,仅凭「单已不存在」无法区分
-        止损与手动平仓,故止损单状态查询为权威依据。
-        """
+    def _resolve_close_reason(
+        self, position: dict[str, Any], lifecycle: dict[str, Any], tp_missing: bool, stop_missing: bool
+    ) -> str:
+        """按已持久化的程序订单事实优先确定原因，REST 状态只作断流恢复。"""
+        reason = lifecycle.get("closeReason")
+        if reason in {"程序止盈", "程序止损", "程序盈亏全平", "外部平仓"}:
+            return str(reason)
         symbol = str(position.get("symbol") or "")
+        if position.get("autoCloseOrderId") or position.get("autoCloseClientOrderId"):
+            return "程序盈亏全平"
         tp_order_id = position.get("takeProfitOrderId")
         if tp_order_id is not None and tp_missing:
             try:
                 status = self._client.get_order_status(symbol, int(tp_order_id)).get("status")
                 if status == "FILLED":
-                    return "止盈"
+                    return "程序止盈"
             except Exception as exc:
                 self.logger.warning("止盈单状态查询失败 symbol=%s: %s", symbol, exc)
         stop_algo_id = position.get("stopAlgoId")
@@ -796,14 +843,14 @@ class PositionMonitor:
             try:
                 status = self._client.get_algo_order_status(symbol, int(stop_algo_id)).get("algoStatus")
                 if status == "TRIGGERED":
-                    return "止损"
+                    return "程序止损"
             except BinanceFuturesError as exc:
                 # -2011 = 条件单已不存在(未触发被取消/手动平仓联动取消)→ 非止损
                 if exc.code != -2011:
                     self.logger.warning("止损单状态查询失败 symbol=%s: %s", symbol, exc)
             except Exception as exc:
                 self.logger.warning("止损单状态查询失败 symbol=%s: %s", symbol, exc)
-        return "手动平仓"
+        return "外部平仓"
 
     def _ledger_quantity(self, symbol: str, open_time: Any) -> float | None:
         """从订单台账回查开仓数量(旧持仓记录未落库 quantity 时的兜底)。"""
@@ -1140,11 +1187,40 @@ class PositionMonitor:
                     continue  # 非程序仓(手动开仓)不参与自动全平
                 side = "SELL" if amount_decimal > 0 else "BUY"
                 quantity = format(abs(amount_decimal), "f")
+                client_order_id = f"bot-autoclose-{uuid.uuid4().hex[:20]}"
+                update_position(
+                    self.config.environment, symbol, str(item.get("positionSide") or "BOTH"),
+                    autoCloseClientOrderId=client_order_id,
+                    autoCloseRequestedAt=datetime.now(timezone.utc).isoformat(),
+                )
                 # 对冲模式带与持仓方向一致的 positionSide;单向模式带 reduceOnly 防反向开仓
-                if dual:
-                    self._client.place_market_order(symbol, side, quantity, str(item.get("positionSide") or "BOTH"))
-                else:
-                    self._client.place_market_order(symbol, side, quantity, None, reduce_only=True)
+                try:
+                    if dual:
+                        result = self._client.place_market_order(
+                            symbol, side, quantity, str(item.get("positionSide") or "BOTH"),
+                            client_order_id=client_order_id,
+                        )
+                    else:
+                        result = self._client.place_market_order(
+                            symbol, side, quantity, None, reduce_only=True, client_order_id=client_order_id,
+                        )
+                except Exception:
+                    # 下单请求明确失败时撤销本地“自动全平已提交”标记，避免误归因。
+                    update_position(
+                        self.config.environment, symbol, str(item.get("positionSide") or "BOTH"),
+                        autoCloseClientOrderId=None, autoCloseRequestedAt=None,
+                    )
+                    raise
+                update_position(
+                    self.config.environment, symbol, str(item.get("positionSide") or "BOTH"),
+                    autoCloseOrderId=result.get("orderId"),
+                )
+                add_event(self.config.environment, side_key, {
+                    "eventId": f"auto-close-request:{result.get('orderId') or client_order_id}",
+                    "eventType": "PROGRAM_AUTO_CLOSE", "eventTime": int(time.time() * 1000),
+                    "orderId": result.get("orderId"), "clientOrderId": client_order_id,
+                    "closeReason": "程序盈亏全平", "evidence": "程序组合盈亏阈值触发的 reduceOnly 市价平仓",
+                })
                 self.logger.info("盈亏自动全平:已平 symbol=%s %s %s", symbol, side, quantity)
                 closed += 1
             self.logger.warning("盈亏自动全平完成 pnl=%+.2f%% 平仓=%s 个", pct, closed)

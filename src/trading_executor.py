@@ -405,13 +405,16 @@ class TradingExecutor:
         if entry is None or stop is None:
             self.logger.warning("开仓登记缺失价格信息 symbol=%s,未写入本地持仓", record.get("symbol"))
             return
-        from position_monitor import add_position
+        from position_lifecycle import create_lifecycle
+        from position_monitor import add_position, position_key
 
         order = record.get("order") if isinstance(record.get("order"), dict) else {}
-        add_position(self.config.environment, {
+        position_side = str(order.get("positionSide") or "BOTH")
+        open_time = order.get("updateTime") or order.get("transactTime") or int(time.time() * 1000)
+        position = {
             "symbol": record.get("symbol"),
             # 单向模式明确保存 BOTH；对冲模式保存交易所回执中的 LONG/SHORT。
-            "positionSide": str(order.get("positionSide") or "BOTH"),
+            "positionSide": position_side,
             "status": "active",
             "signalType": record.get("signalType"),
             "direction": record.get("direction"),
@@ -422,13 +425,20 @@ class TradingExecutor:
             "takeProfitOrderId": order.get("takeProfitOrderId"),
             # 止盈价(箱体内高抛低吸挂中轨限价止盈;突破仓位为 None),供看盘页标注
             "takeProfitPrice": record.get("takeProfitPrice"),
+            "entryOrderId": order.get("orderId"),
+            "entryClientOrderId": order.get("clientOrderId"),
             # 实际成交数量,供平仓盈亏统计展示
             "quantity": record.get("quantity"),
             "r": entry - stop,
             "leverage": record.get("leverage"),
             "trailLevel": 0,
-            "openTime": record.get("signalKlineOpenTime"),
+            "openTime": open_time,
             "createdAt": _now_iso(),
+        }
+        add_position(self.config.environment, position)
+        create_lifecycle(self.config.environment, {
+            **position,
+            "positionKey": position_key(position.get("symbol"), position_side),
         })
 
     def _leverage_for_notional(self, symbol: str, notional: Decimal) -> int:

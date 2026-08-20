@@ -43,6 +43,8 @@ ORDER_PATH = "/fapi/v1/order"
 # 收入历史(已实现盈亏/手续费),供平仓盈亏统计查询
 # 官方文档: https://developers.binance.com/legacy-docs/derivatives/usds-margined-futures/account/rest-api/Get-Income-History
 INCOME_PATH = "/fapi/v1/income"
+# 成交明细用于按订单归因程序仓位的已实现盈亏与手续费。
+USER_TRADES_PATH = "/fapi/v1/userTrades"
 # 2025-12-09 起条件单(STOP_MARKET 等)强制迁移到 Algo Order API,旧端点返回 -4120
 # 官方文档:https://developers.binance.com/legacy-docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
 ALGO_ORDER_PATH = "/fapi/v1/algoOrder"
@@ -246,6 +248,23 @@ class BinanceFuturesClient:
         })
         return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
 
+    def get_user_trades(
+        self, symbol: str, start_time: int, end_time: int, order_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """查询成交明细(/fapi/v1/userTrades)，用于程序仓位生命周期对账。
+
+        仅在本地已登记的程序仓位关闭时使用；不会扫描或归档人工仓位。
+        官方文档：
+        https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/rest-api
+        """
+        params: dict[str, Any] = {
+            "symbol": symbol, "startTime": start_time, "endTime": end_time, "limit": 1000,
+        }
+        if order_id is not None:
+            params["orderId"] = order_id
+        payload = self._signed_request("GET", USER_TRADES_PATH, params)
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
     def get_order_status(self, symbol: str, order_id: int) -> dict[str, Any]:
         """查询普通挂单状态(GET /fapi/v1/order),用于平仓原因推断。"""
         payload = self._signed_request("GET", ORDER_PATH, {"symbol": symbol, "orderId": order_id})
@@ -374,6 +393,7 @@ class BinanceFuturesClient:
         quantity: str,
         position_side: str | None = None,
         reduce_only: bool = False,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         """市价单(/fapi/v1/order,newOrderRespType=RESULT 返回成交均价与数量)。
 
@@ -391,6 +411,8 @@ class BinanceFuturesClient:
             params["positionSide"] = position_side
         if reduce_only:
             params["reduceOnly"] = "true"
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         payload = self._signed_request("POST", ORDER_PATH, params)
         return payload if isinstance(payload, dict) else {}
 

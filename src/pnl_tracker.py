@@ -7,8 +7,8 @@ GUI 展示层按北京时间日期聚合(见 beijing_date_key)。
 记录字段:
 - symbol / signalType / direction / entryPrice / quantity / leverage:开仓信息
 - openTime / closeTime:开仓与平仓时间(毫秒)
-- realizedPnlUsdt / commissionUsdt / netPnlUsdt:已实现盈亏/手续费/净盈亏
-- closeReason:平仓原因(止损/止盈/手动平仓)
+- realizedPnlUsdt / commissionUsdt / fundingFeeUsdt / netPnlUsdt:成交盈亏、手续费、资金费与净盈亏
+- closeReason:由程序订单 ID、条件单事件和成交事实确定的平仓原因
 """
 
 from __future__ import annotations
@@ -87,6 +87,10 @@ def append_pnl_record(environment: str, record: dict[str, Any]) -> None:
             except (OSError, json.JSONDecodeError):
                 payload = {}
         records = payload.get("records") if isinstance(payload.get("records"), list) else []
+        # 进程在“PnL 写入成功、程序持仓删除前”异常重启时，避免同一程序仓位重复记账。
+        key = record.get("positionKey")
+        if key and any(isinstance(item, dict) and item.get("positionKey") == key for item in records):
+            return
         records.append(record)
         payload = {
             "source": {"environment": environment, "updatedAt": datetime.now(timezone.utc).isoformat()},
