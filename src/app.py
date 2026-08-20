@@ -356,9 +356,13 @@ class MainWindow(QMainWindow):
         # None 哨兵:与「无文件」指纹 () 区分,保证首次刷新必定加载
         self._pnl_fingerprint: tuple | None = None
         self._pnl_selected_day: date | None = None
+        # 账户快照由监控线程提供；保留最后一份结构完整的快照，瞬时读取异常时不清空界面。
+        self._account_snapshot_cache: dict[str, Any] | None = None
+        self._last_account_content_signature: tuple | None = None
         # 实时看盘页状态
         self.live_view_open = False
         self.live_symbol = ""
+        self.live_position_key = ""
         self.live_position_closed = False
         self.live_loading_initial = False
         self.live_return_page = 3
@@ -2012,6 +2016,7 @@ class MainWindow(QMainWindow):
         """进入账户持仓页并强制刷新首帧。"""
         self.pages.setCurrentIndex(3)
         self._last_account_snapshot_at = None
+        self._last_account_content_signature = None
         self.refresh_account_page()
 
     def close_account_page(self) -> None:
@@ -2020,6 +2025,7 @@ class MainWindow(QMainWindow):
         self.other_table.setRowCount(0)
         self.trailed_title.setText("移动止损监管中 (0)")
         self.other_title.setText("其他持仓 (0)")
+        self._last_account_content_signature = None
         self.pages.setCurrentIndex(0)
 
     def refresh_account_view(self) -> None:
@@ -2090,10 +2096,13 @@ class MainWindow(QMainWindow):
             self.other_table.setRowCount(0)
             return
         snapshot, trailed, other = self._account_view_data(monitor)
-        # 快照未变化时不重建表格(流数据刷新,避免无谓重绘)
-        if snapshot["updatedAt"] == self._last_account_snapshot_at:
+        # 全市场标记价格流会持续刷新快照时间，即使程序仓位的数据完全没有变化。
+        # 因此用实际展示字段的签名决定是否重绘，避免每秒清空并重建整张表。
+        content_signature = self._account_content_signature(snapshot, trailed, other)
+        if content_signature == self._last_account_content_signature:
             return
         self._last_account_snapshot_at = snapshot["updatedAt"]
+        self._last_account_content_signature = content_signature
 
         usdt = snapshot["balances"].get("USDT", {})
         wallet = float(usdt.get("balance", 0.0))
@@ -2121,25 +2130,46 @@ class MainWindow(QMainWindow):
         self._fill_position_table(self.other_table, other, show_stop=False)
 
     def _account_view_data(self, monitor: Any) -> tuple[dict, list, list]:
-        """从监控器账户快照与本地持仓列表计算受监管/未受监管持仓。
+        """从监控器快照计算程序持仓的两类展示列表。
 
-        仅展示程序开出的仓位(本地台账记录的交易对);人工仓不展示、
-        不统计、不被任何程序行为干预。
+        监控器已按程序持仓列表过滤并携带 local 字段；GUI 不再每秒重复读盘，
+        从而避免原子替换文件时的瞬时空读影响展示。
         """
-        snapshot = monitor.get_account_snapshot()
-        environment = str(read_json_safely(CONFIG_PATH).get("environment", "production"))
+        try:
+            candidate = monitor.get_account_snapshot()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("读取持仓监控快照失败，沿用上次界面数据: %s", exc)
+            candidate = None
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("balances"), dict)
+            and isinstance(candidate.get("positions"), dict)
+            and "updatedAt" in candidate
+        ):
+            snapshot = candidate
+            self._account_snapshot_cache = candidate
+        elif self._account_snapshot_cache is not None:
+            snapshot = self._account_snapshot_cache
+        else:
+            snapshot = {"balances": {}, "positions": {}, "updatedAt": 0.0}
         local_positions = {
-            position_key(p.get("symbol"), p.get("positionSide")): p
-            for p in load_positions(environment)
+            key: dict(info["local"])
+            for key, info in snapshot["positions"].items()
+            if isinstance(info, dict) and isinstance(info.get("local"), dict)
         }
         trailed_symbols = {
             key for key, position in local_positions.items()
             if position.get("signalType") in TRAILED_SIGNALS
         }
-        active = {
-            key: info for key, info in snapshot["positions"].items()
-            if abs(info.get("positionAmt", 0.0)) > 0 and key in local_positions
-        }
+        active = {}
+        for key, info in snapshot["positions"].items():
+            if key not in local_positions or not isinstance(info, dict):
+                continue
+            try:
+                if abs(float(info.get("positionAmt", 0.0))) > 0:
+                    active[key] = info
+            except (TypeError, ValueError):
+                continue
         trailed = [
             (str(info.get("symbol") or key), info, local_positions.get(key))
             for key, info in active.items() if key in trailed_symbols
@@ -2149,6 +2179,24 @@ class MainWindow(QMainWindow):
             for key, info in active.items() if key not in trailed_symbols
         ]
         return snapshot, trailed, other
+
+    @staticmethod
+    def _account_content_signature(snapshot: dict, trailed: list, other: list) -> tuple:
+        """返回所有已展示字段的稳定签名，供 GUI 跳过无关的流更新。"""
+        usdt = snapshot.get("balances", {}).get("USDT", {})
+        balances = (usdt.get("balance"), usdt.get("availableBalance")) if isinstance(usdt, dict) else ()
+
+        def row_signature(row: tuple) -> tuple:
+            symbol, info, local = row
+            return (
+                symbol, info.get("positionSide"), info.get("positionAmt"), info.get("positionAmtStr"),
+                info.get("entryPrice"), info.get("markPrice"), info.get("unrealizedProfit"), info.get("leverage"),
+                local.get("signalType") if isinstance(local, dict) else None,
+                local.get("currentStop") if isinstance(local, dict) else None,
+                local.get("trailLevel") if isinstance(local, dict) else None,
+            )
+
+        return balances, tuple(row_signature(row) for row in trailed), tuple(row_signature(row) for row in other)
 
     @staticmethod
     def _display_pnl(symbol: str, info: dict[str, Any]) -> float:
@@ -2174,22 +2222,29 @@ class MainWindow(QMainWindow):
         if show_stop:
             columns += [("当前止损", "stop"), ("档位", "level")]
         columns.append(("操作", "action"))
-        table.setColumnCount(len(columns))
-        table.setHorizontalHeaderLabels([label for label, _ in columns])
-        table.setRowCount(len(rows))
-        for row, (symbol, info, local) in enumerate(rows):
-            amount = float(info.get("positionAmt", 0.0))
+        # 保留用户当前选中仓位；整表重绘期间禁用更新，避免流刷新造成闪烁。
+        selected_key = None
+        current_item = table.item(table.currentRow(), 0) if table.currentRow() >= 0 else None
+        if current_item is not None:
+            selected_key = current_item.data(Qt.ItemDataRole.UserRole)
+        table.setUpdatesEnabled(False)
+        try:
+            table.setColumnCount(len(columns))
+            table.setHorizontalHeaderLabels([label for label, _ in columns])
+            table.setRowCount(len(rows))
+            for row, (symbol, info, local) in enumerate(rows):
+                amount = float(info.get("positionAmt", 0.0))
             # 数量显示与平仓下单优先使用交易所原始数量字符串(大数量时避免科学计数法/截断)
-            amount_str = info.get("positionAmtStr") if isinstance(info.get("positionAmtStr"), str) else None
-            entry = float(info.get("entryPrice", 0.0))
-            mark = float(info.get("markPrice", 0.0))
+                amount_str = info.get("positionAmtStr") if isinstance(info.get("positionAmtStr"), str) else None
+                entry = float(info.get("entryPrice", 0.0))
+                mark = float(info.get("markPrice", 0.0))
             # 展示盈亏 = 实时标记价按官方公式计算(markPrice 每秒由流更新),mark 缺失回退官方值
-            unrealized = (mark - entry) * amount if mark > 0 else float(info.get("unrealizedProfit", 0.0))
-            leverage = int(info.get("leverage", 0) or 0)
+                unrealized = (mark - entry) * amount if mark > 0 else float(info.get("unrealizedProfit", 0.0))
+                leverage = int(info.get("leverage", 0) or 0)
             # 杠杆未知(手动开仓且无 symbolConfig 记录)时显示占位,不误导为 1x
-            margin = abs(amount) * entry / leverage if entry > 0 and leverage > 0 else 0.0
-            pnl_pct = unrealized / margin * 100 if margin > 0 else 0.0
-            values: dict[str, str] = {
+                margin = abs(amount) * entry / leverage if entry > 0 and leverage > 0 else 0.0
+                pnl_pct = unrealized / margin * 100 if margin > 0 else 0.0
+                values: dict[str, str] = {
                 "symbol": symbol,
                 "direction": "多" if amount > 0 else "空",
                 "quantity": self._quantity_text(amount, amount_str),
@@ -2198,29 +2253,37 @@ class MainWindow(QMainWindow):
                 "unrealized": f"{unrealized:+,.2f}",
                 "pnl_pct": f"{pnl_pct:+.2f}%" if margin > 0 else "—",
                 "leverage": f"{leverage}x" if leverage > 0 else "—",
-            }
-            if show_stop:
-                current_stop = local.get("currentStop") if isinstance(local, dict) else None
-                level = local.get("trailLevel") if isinstance(local, dict) else None
-                values["stop"] = f"{current_stop:.8g}" if current_stop is not None else "—"
-                values["level"] = str(level) if level is not None else "—"
-            profit_color, loss_color = profit_colors()
-            for column, (_, field) in enumerate(columns):
-                if field == "action":
+                }
+                if show_stop:
+                    current_stop = local.get("currentStop") if isinstance(local, dict) else None
+                    level = local.get("trailLevel") if isinstance(local, dict) else None
+                    values["stop"] = f"{current_stop:.8g}" if current_stop is not None else "—"
+                    values["level"] = str(level) if level is not None else "—"
+                profit_color, loss_color = profit_colors()
+                row_key = position_key(symbol, info.get("positionSide"))
+                for column, (_, field) in enumerate(columns):
+                    if field == "action":
                     # 操作列:点击单元格即平仓(无额外按钮),深蓝加粗居中文本,悬停浅色背景下仍清晰
-                    item = QTableWidgetItem("平仓")
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    item.setForeground(QColor("#1D4ED8"))
-                    action_font = item.font()
-                    action_font.setBold(True)
-                    item.setFont(action_font)
-                    item.setData(Qt.ItemDataRole.UserRole, (symbol, amount, amount_str))
-                else:
-                    item = QTableWidgetItem(values[field])
-                    if field == "unrealized":
-                        item.setForeground(QColor(profit_color if unrealized >= 0 else loss_color))
-                table.setItem(row, column, item)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                        item = QTableWidgetItem("平仓")
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        item.setForeground(QColor("#1D4ED8"))
+                        action_font = item.font()
+                        action_font.setBold(True)
+                        item.setFont(action_font)
+                        item.setData(Qt.ItemDataRole.UserRole, (symbol, amount, amount_str))
+                    else:
+                        item = QTableWidgetItem(values[field])
+                        if field == "unrealized":
+                            item.setForeground(QColor(profit_color if unrealized >= 0 else loss_color))
+                        if column == 0:
+                            item.setData(Qt.ItemDataRole.UserRole, row_key)
+                    table.setItem(row, column, item)
+                    if row_key == selected_key:
+                        table.setCurrentCell(row, 0)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        finally:
+            table.setUpdatesEnabled(True)
+            table.viewport().update()
 
     # ---- 平仓操作 ----
 
@@ -2244,7 +2307,8 @@ class MainWindow(QMainWindow):
             return
         symbol = item.text()
         if symbol:
-            self.open_live_symbol_view(symbol, 3)
+            key = item.data(Qt.ItemDataRole.UserRole)
+            self.open_live_symbol_view(symbol, 3, key if isinstance(key, str) else None)
 
     def confirm_close_single(self, symbol: str, amount: float, amount_str: str | None = None) -> None:
         """单个仓位平仓:二次确认后市价反向平仓。
@@ -2380,14 +2444,18 @@ class MainWindow(QMainWindow):
 
     # ---- 实时看盘页 ----
 
-    def open_live_symbol_view(self, symbol: str, return_page: int = 3) -> None:
+    def open_live_symbol_view(
+        self, symbol: str, return_page: int = 3, position_identity: str | None = None,
+    ) -> None:
         """进入实时看盘页:加载历史 K 线并订阅实时流(交易所看盘体验)。"""
         if not symbol:
             return
-        if self.live_view_open and self.live_symbol == symbol:
+        resolved_key = position_identity or self._live_position_key_for_symbol(symbol)
+        if self.live_view_open and self.live_symbol == symbol and self.live_position_key == resolved_key:
             self.pages.setCurrentIndex(5)
             return
         self.live_symbol = symbol
+        self.live_position_key = resolved_key
         self.live_view_open = True
         self.live_position_closed = False
         self.live_loading_initial = False
@@ -2406,6 +2474,7 @@ class MainWindow(QMainWindow):
         """退出实时看盘页:关闭 K 线流并销毁图表内容(返回进入前页面)。"""
         self.live_view_open = False
         self.live_symbol = ""
+        self.live_position_key = ""
         if self.live_kline_stream is not None:
             self.live_kline_stream.stop()
             self.live_kline_stream = None
@@ -2455,10 +2524,7 @@ class MainWindow(QMainWindow):
             self.live_kline_stream = KlineStream(use_testnet, proxy, self._on_live_kline_event)
             self.live_kline_stream.start()
         self.live_kline_stream.set_subscription(symbol, interval)
-        local = next(
-            (p for p in load_positions(self._current_environment()) if p.get("symbol") == self.live_symbol),
-            None,
-        )
+        local = self._live_position_info()[1]
         self._update_live_annotations(local)
 
     def _on_live_kline_event(self, payload: dict[str, Any]) -> None:
@@ -2494,17 +2560,11 @@ class MainWindow(QMainWindow):
         """实时看盘页 1 秒刷新:价格头部、标注线(移动止损抬升)、平仓检测。"""
         if not self.live_view_open or not self.live_symbol:
             return
-        monitor = get_active_monitor()
-        snapshot = monitor.get_account_snapshot() if monitor is not None else {"positions": {}}
-        info = snapshot["positions"].get(self.live_symbol)
+        info, local = self._live_position_info()
         amount = float(info.get("positionAmt", 0.0)) if isinstance(info, dict) else 0.0
         if abs(amount) <= 0:
             self._mark_live_position_closed()
             return
-        local = next(
-            (p for p in load_positions(self._current_environment()) if p.get("symbol") == self.live_symbol),
-            None,
-        )
         mark = float(info.get("markPrice", 0.0) or 0.0)
         entry = float(info.get("entryPrice", 0.0) or 0.0)
         leverage = int(info.get("leverage", 0) or 0)
@@ -2546,10 +2606,7 @@ class MainWindow(QMainWindow):
         """
         annotations: list[dict[str, Any]] = []
         profit_color, loss_color = profit_colors()
-        monitor = get_active_monitor()
-        info = None
-        if monitor is not None:
-            info = monitor.get_account_snapshot()["positions"].get(self.live_symbol)
+        info, _ = self._live_position_info()
         entry_price = float((local or {}).get("entryPrice") or (info or {}).get("entryPrice") or 0.0)
         if entry_price > 0:
             annotations.append({"price": entry_price, "label": "开仓", "color": QColor("#F59E0B"), "dashed": False})
@@ -2590,16 +2647,43 @@ class MainWindow(QMainWindow):
 
     def confirm_close_live_position(self) -> None:
         """看盘页市价平仓:复用持仓页的单仓平仓确认流程。"""
-        monitor = get_active_monitor()
-        if monitor is None:
-            return
-        info = monitor.get_account_snapshot()["positions"].get(self.live_symbol)
+        info, _ = self._live_position_info()
         if not isinstance(info, dict):
             return
         amount = float(info.get("positionAmt", 0.0) or 0.0)
         if amount != 0:
             amount_str = info.get("positionAmtStr") if isinstance(info.get("positionAmtStr"), str) else None
             self.confirm_close_single(self.live_symbol, amount, amount_str)
+
+    def _live_position_key_for_symbol(self, symbol: str) -> str:
+        """按交易对解析唯一的程序仓位键；对冲双向同时存在时不猜测方向。"""
+        monitor = get_active_monitor()
+        if monitor is None:
+            return ""
+        snapshot, _, _ = self._account_view_data(monitor)
+        keys = [
+            key for key, info in snapshot["positions"].items()
+            if isinstance(info, dict) and info.get("symbol") == symbol
+            and abs(float(info.get("positionAmt", 0.0) or 0.0)) > 0
+        ]
+        return keys[0] if len(keys) == 1 else ""
+
+    def _live_position_info(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """读取实时看盘目标的程序仓位；使用持仓键以兼容对冲模式。"""
+        monitor = get_active_monitor()
+        if monitor is None:
+            return None, None
+        snapshot, _, _ = self._account_view_data(monitor)
+        info = snapshot["positions"].get(self.live_position_key)
+        if not isinstance(info, dict) and not self.live_position_key:
+            candidates = [
+                value for value in snapshot["positions"].values()
+                if isinstance(value, dict) and value.get("symbol") == self.live_symbol
+            ]
+            info = candidates[0] if len(candidates) == 1 else None
+        return info if isinstance(info, dict) else None, (
+            dict(info["local"]) if isinstance(info, dict) and isinstance(info.get("local"), dict) else None
+        )
 
     def _symbol_has_position(self, symbol: str) -> bool:
         """判断交易对当前是否有持仓(本地台账记录或交易所快照)。"""
@@ -2608,8 +2692,12 @@ class MainWindow(QMainWindow):
         monitor = get_active_monitor()
         if monitor is None:
             return False
-        info = monitor.get_account_snapshot()["positions"].get(symbol)
-        return isinstance(info, dict) and abs(float(info.get("positionAmt", 0.0) or 0.0)) > 0
+        snapshot, _, _ = self._account_view_data(monitor)
+        return any(
+            isinstance(info, dict) and info.get("symbol") == symbol
+            and abs(float(info.get("positionAmt", 0.0) or 0.0)) > 0
+            for info in snapshot["positions"].values()
+        )
 
     def _current_environment(self) -> str:
         """返回配置中的当前运行环境。"""

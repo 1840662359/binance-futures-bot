@@ -112,6 +112,23 @@ class PositionIdentityTests(unittest.TestCase):
         ]):
             self.assertEqual(monitor._current_pnl_pct(), -8.0)
 
+    def test_gui_snapshot_is_a_consistent_copy_of_program_positions(self) -> None:
+        monitor = object.__new__(PositionMonitor)
+        monitor.config = SimpleNamespace(environment="production")
+        monitor._state_lock = threading.RLock()
+        monitor._account_balances = {"USDT": {"balance": 1000.0}}
+        key = position_key("BTCUSDT", "LONG")
+        monitor._account_positions = {key: {"symbol": "BTCUSDT", "positionAmt": 1.0}}
+        monitor._snapshot_updated_at = 12.0
+        with patch("position_monitor.load_positions", return_value=[
+            {"symbol": "BTCUSDT", "positionSide": "LONG", "signalType": "上破"},
+        ]):
+            snapshot = monitor.get_account_snapshot()
+        self.assertEqual(set(snapshot["positions"]), {key})
+        self.assertEqual(snapshot["positions"][key]["local"]["signalType"], "上破")
+        snapshot["positions"][key]["positionAmt"] = 99.0
+        self.assertEqual(monitor._account_positions[key]["positionAmt"], 1.0)
+
     def test_lifecycle_only_records_registered_program_position_and_keeps_strong_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory)

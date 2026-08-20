@@ -609,14 +609,17 @@ class PositionMonitor:
             position_key(item.get("symbol"), item.get("positionSide")): item
             for item in load_positions(self.config.environment)
         }
-        return {
-            "balances": {asset: dict(info) for asset, info in self._account_balances.items()},
-            "positions": {
-                key: {**dict(info), "managed": True, "local": dict(managed[key])}
-                for key, info in self._account_positions.items() if key in managed
-            },
-            "updatedAt": self._snapshot_updated_at,
-        }
+        # GUI 与 WebSocket/REST 线程并发访问；在同一把状态锁内复制出完整不可变视图，
+        # 避免 GUI 读到余额、仓位和更新时间来自不同一次状态更新的混合快照。
+        with self._state_lock:
+            return {
+                "balances": {asset: dict(info) for asset, info in self._account_balances.items()},
+                "positions": {
+                    key: {**dict(info), "managed": True, "local": dict(managed[key])}
+                    for key, info in self._account_positions.items() if key in managed
+                },
+                "updatedAt": self._snapshot_updated_at,
+            }
 
     def _reconcile(self) -> None:
         """对齐:本地有而交易所无的仓位视为幽灵,清理本地并取消残留挂单。"""
