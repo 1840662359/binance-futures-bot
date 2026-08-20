@@ -2120,9 +2120,10 @@ class MainWindow(QMainWindow):
         # 未实现盈亏百分比:以钱包余额为基准,与盈亏自动全平触发口径一致
         pnl_pct = total_unrealized / wallet * 100 if wallet > 0 else None
         pnl_pct_text = f" (<b style='color:{up_color}'>{pnl_pct:+.2f}%</b>)" if pnl_pct is not None else ""
+        stale_text = " · <b style='color:#B45309'>数据已过期</b>" if snapshot.get("stale") else ""
         self.account_balance_label.setText(
             f"USDT 钱包 <b>{wallet:,.2f}</b> · 可用 <b>{available:,.2f}</b> · "
-            f"未实现盈亏 <b style='color:{up_color}'>{total_unrealized:+,.2f}</b>{pnl_pct_text}"
+            f"未实现盈亏 <b style='color:{up_color}'>{total_unrealized:+,.2f}</b>{pnl_pct_text}{stale_text}"
         )
         self.trailed_title.setText(f"移动止损监管中 ({len(trailed)})")
         self.other_title.setText(f"其他持仓 ({len(other)})")
@@ -2149,7 +2150,8 @@ class MainWindow(QMainWindow):
             snapshot = candidate
             self._account_snapshot_cache = candidate
         elif self._account_snapshot_cache is not None:
-            snapshot = self._account_snapshot_cache
+            # 读取异常时保留上一帧，同时标记为陈旧，不能伪装成实时账户数据。
+            snapshot = {**self._account_snapshot_cache, "stale": True}
         else:
             snapshot = {"balances": {}, "positions": {}, "updatedAt": 0.0}
         local_positions = {

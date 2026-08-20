@@ -53,6 +53,8 @@ LISTEN_KEY_RENEW_SECONDS = 1800
 STREAM_FALLBACK_SECONDS = 10
 MARK_STALE_SECONDS = 5
 ACCOUNT_EVENT_DEBOUNCE_SECONDS = 0.25
+GUI_SNAPSHOT_STALE_SECONDS = 30
+OPENING_RECOVERY_SECONDS = 20
 ATR_PERIOD = 14
 # 移动止损缓冲:1.5×箱体周期 ATR(14)，在容纳结构周期波动与锁利回吐之间折中
 TRAIL_STOP_ATR_MULTIPLIER = Decimal("1.5")
@@ -280,6 +282,7 @@ class PositionMonitor:
         self._last_account_fallback = 0.0
         self._last_mark_fallback = 0.0
         self._account_reconcile_due = 0.0
+        self._opening_reconcile_due = 0.0
         self._user_stream_connected = False
         self._mark_stream_connected = False
         # 只有该时点后的完整 positionRisk 快照才可参与风险动作；网络失败绝不清空旧状态。
@@ -364,6 +367,9 @@ class PositionMonitor:
                     self._renew_listen_key()
                 if self._account_reconcile_due and now >= self._account_reconcile_due:
                     self._account_reconcile_due = 0.0
+                    self._full_snapshot()
+                if self._opening_reconcile_due and now >= self._opening_reconcile_due:
+                    self._opening_reconcile_due = 0.0
                     self._full_snapshot()
                 if not self._user_stream_connected and now - self._last_account_fallback >= STREAM_FALLBACK_SECONDS:
                     self._last_account_fallback = now
@@ -619,12 +625,21 @@ class PositionMonitor:
                     for key, info in self._account_positions.items() if key in managed
                 },
                 "updatedAt": self._snapshot_updated_at,
+                "stale": bool(
+                    self._snapshot_updated_at
+                    and time.monotonic() - self._snapshot_updated_at > GUI_SNAPSHOT_STALE_SECONDS
+                ),
             }
 
     def _reconcile(self) -> None:
         """对齐:本地有而交易所无的仓位视为幽灵,清理本地并取消残留挂单。"""
         for position in load_positions(self.config.environment):
             key = position_key(position.get("symbol"), position.get("positionSide"))
+            if position.get("status") == "opening":
+                # 开仓请求前已落盘的恢复意图不能按普通幽灵清理：HTTP 超时可能已成交。
+                # 正常下单流程会很快将其覆盖为 active，超过宽限期才交由监控器恢复。
+                self._recover_opening_position(position, self._exchange_positions.get(key))
+                continue
             # 兼容已存在的旧程序持仓：首次看到时补建生命周期账本。
             create_lifecycle(self.config.environment, {**position, "positionKey": key})
             amount = self._exchange_positions.get(key)
@@ -650,6 +665,60 @@ class PositionMonitor:
                 update_position(self.config.environment, str(position.get("symbol")), str(position.get("positionSide") or "BOTH"), status="active", conflictReason=None)
         # 仅为本地有且交易所也有的突破仓位维持独立子任务。
         self._sync_trailing_tasks()
+
+    def _recover_opening_position(self, position: dict[str, Any], amount: float | None) -> None:
+        """恢复请求结果未知或进程中断前遗留的开仓意图。"""
+        try:
+            created = datetime.fromisoformat(str(position.get("openingCreatedAt") or "")).timestamp()
+        except ValueError:
+            created = 0.0
+        if created and time.time() - created < OPENING_RECOVERY_SECONDS:
+            remaining = max(1.0, OPENING_RECOVERY_SECONDS - (time.time() - created))
+            due = time.monotonic() + remaining
+            if not self._opening_reconcile_due or due < self._opening_reconcile_due:
+                self._opening_reconcile_due = due
+            return
+        symbol = str(position.get("symbol") or "")
+        side = str(position.get("positionSide") or "BOTH")
+        client_order_id = str(position.get("entryClientOrderId") or "")
+        if amount is not None and abs(amount) > 0:
+            # 交易所仓位已存在，立即将意图升级为可监管仓位；初始保护订单在
+            # 下一次执行器返回时会写入，若为异常重启则至少不会再被忽略。
+            with self._state_lock:
+                account = dict(self._account_positions.get(position_key(symbol, side), {}))
+            entry = _safe_float(account.get("entryPrice")) or _safe_float(position.get("entryPrice"))
+            stop = _safe_float(position.get("initialStop"))
+            update_position(
+                self.config.environment, symbol, side,
+                status="active", entryPrice=entry, quantity=abs(amount),
+                r=entry - stop if entry and stop else position.get("r"),
+                recoveredAt=datetime.now(timezone.utc).isoformat(),
+                reconciliationNote="开仓请求结果恢复为交易所实际持仓",
+            )
+            create_lifecycle(self.config.environment, {
+                **position, "positionKey": position_key(symbol, side), "entryPrice": entry,
+            })
+            if not position.get("stopAlgoId") and stop > 0:
+                stop_side = "SELL" if position.get("direction") == "多" else "BUY"
+                protection = self._place_stop_with_retry(
+                    symbol, stop_side, Decimal(str(stop)), side if side in {"LONG", "SHORT"} else None,
+                )
+                if protection is not None:
+                    update_position(self.config.environment, symbol, side, stopAlgoId=protection.get("algoId"))
+                else:
+                    self.logger.critical("恢复开仓后初始止损挂单失败 symbol=%s，需人工处理", symbol)
+            self.logger.error("已恢复未知结果的程序开仓 symbol=%s side=%s", symbol, side)
+            return
+        if not client_order_id:
+            return
+        try:
+            status = str(self._client.get_order_status(symbol, client_order_id=client_order_id).get("status") or "")
+        except Exception as exc:
+            self.logger.warning("开仓意图状态查询失败，继续保留 symbol=%s: %s", symbol, exc)
+            return
+        if status in {"CANCELED", "REJECTED", "EXPIRED"}:
+            remove_position(self.config.environment, symbol, side)
+            self.logger.info("未成交开仓意图已清理 symbol=%s status=%s", symbol, status)
 
     def _mark_conflict(self, position: dict[str, Any], reason: str) -> None:
         """标记外部干预冲突；冲突仓位不再被自动撤单、移动止损或平仓。"""
@@ -723,6 +792,8 @@ class PositionMonitor:
         if quantity is None:
             quantity = self._ledger_quantity(symbol, open_time)
         record = {
+            # 同一交易对同一方向可在同日多次完整开平，positionKey 不是唯一成交生命周期。
+            "recordId": f"{key}|{open_time}",
             "positionKey": key,
             "symbol": symbol,
             "signalType": position.get("signalType"),
@@ -783,7 +854,39 @@ class PositionMonitor:
         commission = 0.0
         commission_by_asset: dict[str, float] = {}
         exit_order_ids: list[int] = []
-        trades = self._client.get_user_trades(symbol, start, close_time)
+        # userTrades 单页最多 1000 条；按 fromId 向前翻页，避免高频成交时
+        # 静默截断程序仓位的已实现盈亏和手续费。
+        trades: list[dict[str, Any]] = []
+        seen_trade_ids: set[str] = set()
+        from_id: int | None = None
+        for _ in range(100):
+            page = self._client.get_user_trades(symbol, start, close_time, from_id=from_id)
+            if not page:
+                break
+            for trade in page:
+                identity = str(trade.get("id") or trade.get("tradeId") or "")
+                if identity and identity in seen_trade_ids:
+                    continue
+                if identity:
+                    seen_trade_ids.add(identity)
+                trades.append(trade)
+            if len(page) < 1000:
+                break
+            page_ids = []
+            for trade in page:
+                try:
+                    page_ids.append(int(trade.get("id", trade.get("tradeId"))))
+                except (TypeError, ValueError):
+                    continue
+            if not page_ids:
+                self.logger.warning("盈亏成交分页缺少 trade id，停止继续翻页 symbol=%s", symbol)
+                break
+            next_from_id = max(page_ids) + 1
+            if from_id is not None and next_from_id <= from_id:
+                break
+            from_id = next_from_id
+        else:
+            self.logger.warning("盈亏成交分页达到安全上限 symbol=%s", symbol)
         for trade in trades:
             trade_side = str(trade.get("positionSide") or "BOTH")
             if position_side != "BOTH" and trade_side != position_side:
@@ -810,18 +913,29 @@ class PositionMonitor:
                     exit_order_ids.append(order_id)
         # 用户成交明细暂不可用时，回退收入历史；仍仅由已登记程序仓位触发。
         if not trades:
-            for item in self._client.get_income(symbol, start, close_time, "REALIZED_PNL"):
+            for item in self._income_pages(symbol, start, close_time, "REALIZED_PNL"):
                 realized += _safe_float(item.get("income"))
-            for item in self._client.get_income(symbol, start, close_time, "COMMISSION"):
+            for item in self._income_pages(symbol, start, close_time, "COMMISSION"):
                 fee = _safe_float(item.get("income"))
                 commission += fee
                 commission_by_asset["USDT"] = commission_by_asset.get("USDT", 0.0) + fee
         # funding fee 不会出现在 userTrades，单独以收入历史补入。
         funding = sum(
             _safe_float(item.get("income"))
-            for item in self._client.get_income(symbol, start, close_time, "FUNDING_FEE")
+            for item in self._income_pages(symbol, start, close_time, "FUNDING_FEE")
         )
         return realized, commission, funding, commission_by_asset, exit_order_ids
+
+    def _income_pages(self, symbol: str, start: int, end: int, income_type: str) -> list[dict[str, Any]]:
+        """分页读取收入历史，避免单页 1000 条限制截断 PnL。"""
+        items: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            result = self._client.get_income(symbol, start, end, income_type, page=page)
+            items.extend(result)
+            if len(result) < 1000:
+                return items
+        self.logger.warning("收入历史分页达到安全上限 symbol=%s type=%s", symbol, income_type)
+        return items
 
     def _resolve_close_reason(
         self, position: dict[str, Any], lifecycle: dict[str, Any], tp_missing: bool, stop_missing: bool
@@ -1207,13 +1321,15 @@ class PositionMonitor:
                         result = self._client.place_market_order(
                             symbol, side, quantity, None, reduce_only=True, client_order_id=client_order_id,
                         )
-                except Exception:
+                except Exception as exc:
                     # 下单请求明确失败时撤销本地“自动全平已提交”标记，避免误归因。
                     update_position(
                         self.config.environment, symbol, str(item.get("positionSide") or "BOTH"),
                         autoCloseClientOrderId=None, autoCloseRequestedAt=None,
                     )
-                    raise
+                    # 单仓失败不得阻断其余程序仓的风险退出；失败仓仍由监控器继续管理。
+                    self.logger.error("盈亏自动全平失败 symbol=%s，继续处理其余仓位: %s", symbol, exc)
+                    continue
                 update_position(
                     self.config.environment, symbol, str(item.get("positionSide") or "BOTH"),
                     autoCloseOrderId=result.get("orderId"),

@@ -233,7 +233,9 @@ class BinanceFuturesClient:
                 leverage_map[item["symbol"]] = leverage
         return leverage_map
 
-    def get_income(self, symbol: str, start_time: int, end_time: int, income_type: str) -> list[dict[str, Any]]:
+    def get_income(
+        self, symbol: str, start_time: int, end_time: int, income_type: str, page: int = 1,
+    ) -> list[dict[str, Any]]:
         """查询指定交易对时间窗内的收入历史(/fapi/v1/income),返回明细列表。
 
         incomeType 支持 REALIZED_PNL(已实现盈亏)、COMMISSION(手续费,负值)等;
@@ -245,11 +247,17 @@ class BinanceFuturesClient:
             "startTime": start_time,
             "endTime": end_time,
             "limit": 1000,
+            "page": page,
         })
         return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
 
     def get_user_trades(
-        self, symbol: str, start_time: int, end_time: int, order_id: int | None = None
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+        order_id: int | None = None,
+        from_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """查询成交明细(/fapi/v1/userTrades)，用于程序仓位生命周期对账。
 
@@ -262,12 +270,28 @@ class BinanceFuturesClient:
         }
         if order_id is not None:
             params["orderId"] = order_id
+        if from_id is not None:
+            params["fromId"] = from_id
         payload = self._signed_request("GET", USER_TRADES_PATH, params)
         return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
 
-    def get_order_status(self, symbol: str, order_id: int) -> dict[str, Any]:
-        """查询普通挂单状态(GET /fapi/v1/order),用于平仓原因推断。"""
-        payload = self._signed_request("GET", ORDER_PATH, {"symbol": symbol, "orderId": order_id})
+    def get_order_status(
+        self, symbol: str, order_id: int | None = None, client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """查询普通订单状态(GET /fapi/v1/order)。
+
+        orderId 与 origClientOrderId 二选一；开仓请求结果未知时用稳定的
+        newClientOrderId 回查交易所，避免把实际成交误判成失败。
+        官方文档：https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/trade/rest-api/Query-Order
+        """
+        if order_id is None and not client_order_id:
+            raise ValueError("查询订单状态必须提供 order_id 或 client_order_id。")
+        params: dict[str, Any] = {"symbol": symbol}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
+        payload = self._signed_request("GET", ORDER_PATH, params)
         return payload if isinstance(payload, dict) else {}
 
     def get_algo_order_status(self, symbol: str, algo_id: int) -> dict[str, Any]:

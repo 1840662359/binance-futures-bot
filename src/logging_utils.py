@@ -25,7 +25,15 @@ def configure_logging(environment: str) -> logging.Logger:
     log_path = runtime_directory(environment) / "logs" / "application.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not any(getattr(handler, "baseFilename", None) == str(log_path.resolve()) for handler in logger.handlers):
+    # 同一 GUI 进程可在停止后切换 production/testnet 再启动；移除旧环境
+    # handler，避免日志被双写或写入错误环境。
+    expected_path = str(log_path.resolve())
+    for handler in tuple(logger.handlers):
+        if isinstance(handler, TimedRotatingFileHandler) and handler.baseFilename != expected_path:
+            logger.removeHandler(handler)
+            handler.close()
+
+    if not any(getattr(handler, "baseFilename", None) == expected_path for handler in logger.handlers):
         handler = TimedRotatingFileHandler(
             log_path, when="midnight", interval=1, backupCount=30, encoding="utf-8", utc=True
         )

@@ -153,14 +153,14 @@ class PositionIdentityTests(unittest.TestCase):
 
     def test_lifecycle_pnl_filters_hedge_side_and_includes_funding(self) -> None:
         class Client:
-            def get_user_trades(self, *_):
+            def get_user_trades(self, *_, **__):
                 return [
                     {"positionSide": "LONG", "side": "BUY", "realizedPnl": "0", "commission": "-1", "commissionAsset": "USDT", "orderId": 1},
                     {"positionSide": "LONG", "side": "SELL", "realizedPnl": "10", "commission": "-1", "commissionAsset": "USDT", "orderId": 2},
                     {"positionSide": "SHORT", "side": "BUY", "realizedPnl": "999", "commission": "-9", "commissionAsset": "USDT", "orderId": 3},
                 ]
 
-            def get_income(self, *_):
+            def get_income(self, *_, **__):
                 return [{"income": "0.5"}]
 
         monitor = object.__new__(PositionMonitor)

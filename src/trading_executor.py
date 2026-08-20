@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from pathlib import Path
@@ -196,7 +197,7 @@ class TradingExecutor:
             try:
                 record = self._process_signal(signal, ledger, run_id, opened_in_round)
             except Exception as exc:
-                record = self._failed_record(signal, run_id, f"未预期异常:{exc}")
+                record = self._failed_record(signal, f"未预期异常:{exc}", run_id)
             if record.get("status") == "filled" or record.get("consumeSignal"):
                 # 成交或「消费但不下单」(预估盈利不足/交易限制)均标记消费,防止信号重放;
                 # consumedStatus 区分:filled=已按信号开仓,abandoned=放弃开仓(原因见 consumedReason)
@@ -646,10 +647,22 @@ class TradingExecutor:
             client.set_leverage(symbol, leverage)
         except Exception as exc:
             return self._failed_record(computed, f"设置杠杆失败:{exc}", computed.get("runId"))
+        # 先落盘开仓意图，再向交易所发单。网络超时/进程退出时，监控器仍可依据
+        # entryClientOrderId 和初始止损识别这个程序仓位并在启动后恢复监管。
+        client_order_id = f"bot-entry-{uuid.uuid4().hex[:22]}"
+        self._register_opening_position(computed, position_side, client_order_id, stop_price)
         try:
-            order = client.place_market_order(symbol, side, quantity_text, position_side)
+            order = client.place_market_order(
+                symbol, side, quantity_text, position_side, client_order_id=client_order_id,
+            )
         except Exception as exc:
-            return self._failed_record(computed, f"市价单下单失败:{exc}", computed.get("runId"))
+            # POST 超时不等于撮合失败；以客户端订单号回查一次，避免重复发单或遗失实际成交。
+            try:
+                order = client.get_order_status(symbol, client_order_id=client_order_id)
+            except Exception:
+                return self._failed_record(
+                    computed, f"市价单结果未知(已保留恢复意图):{exc}", computed.get("runId")
+                )
         if order.get("status") != "FILLED":
             return self._failed_record(computed, f"市价单未成交,状态 {order.get('status')}", computed.get("runId"))
 
@@ -733,6 +746,33 @@ class TradingExecutor:
                 take_profit_note = "入场价已越过中轨,止盈价无意义,未挂止盈单"
         computed["order"]["takeProfitNote"] = take_profit_note
         return {**computed, "status": "filled", "summaryKey": "executed"}
+
+    def _register_opening_position(
+        self, computed: dict[str, Any], position_side: str | None, client_order_id: str, stop_price: Decimal,
+    ) -> None:
+        """在开仓请求前持久化可恢复的程序开仓意图。"""
+        from position_monitor import add_position
+
+        entry = computed.get("estimatedEntry")
+        stop = float(stop_price)
+        now_ms = int(time.time() * 1000)
+        add_position(self.config.environment, {
+            "symbol": computed.get("symbol"),
+            "positionSide": position_side or "BOTH",
+            "status": "opening",
+            "signalType": computed.get("signalType"),
+            "direction": computed.get("direction"),
+            "entryPrice": entry,
+            "initialStop": stop,
+            "currentStop": stop,
+            "quantity": computed.get("quantity"),
+            "r": float(entry) - stop if entry is not None else None,
+            "leverage": computed.get("leverage"),
+            "trailLevel": 0,
+            "openTime": now_ms,
+            "entryClientOrderId": client_order_id,
+            "openingCreatedAt": _now_iso(),
+        })
 
     def _query_position_after_order(
         self, client: BinanceFuturesClient, symbol: str, position_side: str | None

@@ -88,8 +88,11 @@ def append_pnl_record(environment: str, record: dict[str, Any]) -> None:
                 payload = {}
         records = payload.get("records") if isinstance(payload.get("records"), list) else []
         # 进程在“PnL 写入成功、程序持仓删除前”异常重启时，避免同一程序仓位重复记账。
-        key = record.get("positionKey")
-        if key and any(isinstance(item, dict) and item.get("positionKey") == key for item in records):
+        # positionKey 只区分 symbol|side，同日再次开同方向仓位会复用；
+        # 因此优先使用 positionKey+实际 openTime 组成的生命周期唯一记录 ID。
+        key = record.get("recordId") or record.get("positionKey")
+        key_field = "recordId" if record.get("recordId") else "positionKey"
+        if key and any(isinstance(item, dict) and item.get(key_field) == key for item in records):
             return
         records.append(record)
         payload = {
