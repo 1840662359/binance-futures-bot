@@ -31,7 +31,7 @@ from app_paths import ensure_app_config, runtime_directory
 from kline_chart import KlineChartWidget, apply_color_style
 from logging_utils import configure_logging
 from pnl_tracker import aggregate_days, beijing_date_key, pnl_directory, read_pnl_records
-from position_monitor import TRAILED_SIGNALS, get_active_monitor, load_positions
+from position_monitor import TRAILED_SIGNALS, get_active_monitor, load_positions, position_key
 from scheduler import CONFIG_PATH, PoolScheduler, _history_timestamp, bucket_start, get_current_activity, load_config, run_scheduler
 from secret_utils import get_secret
 
@@ -2128,17 +2128,26 @@ class MainWindow(QMainWindow):
         """
         snapshot = monitor.get_account_snapshot()
         environment = str(read_json_safely(CONFIG_PATH).get("environment", "production"))
-        local_positions = {p.get("symbol"): p for p in load_positions(environment)}
+        local_positions = {
+            position_key(p.get("symbol"), p.get("positionSide")): p
+            for p in load_positions(environment)
+        }
         trailed_symbols = {
-            symbol for symbol, position in local_positions.items()
+            key for key, position in local_positions.items()
             if position.get("signalType") in TRAILED_SIGNALS
         }
         active = {
-            symbol: info for symbol, info in snapshot["positions"].items()
-            if abs(info.get("positionAmt", 0.0)) > 0 and symbol in local_positions
+            key: info for key, info in snapshot["positions"].items()
+            if abs(info.get("positionAmt", 0.0)) > 0 and key in local_positions
         }
-        trailed = [(symbol, info, local_positions.get(symbol)) for symbol, info in active.items() if symbol in trailed_symbols]
-        other = [(symbol, info, local_positions.get(symbol)) for symbol, info in active.items() if symbol not in trailed_symbols]
+        trailed = [
+            (str(info.get("symbol") or key), info, local_positions.get(key))
+            for key, info in active.items() if key in trailed_symbols
+        ]
+        other = [
+            (str(info.get("symbol") or key), info, local_positions.get(key))
+            for key, info in active.items() if key not in trailed_symbols
+        ]
         return snapshot, trailed, other
 
     @staticmethod

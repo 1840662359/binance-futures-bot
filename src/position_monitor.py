@@ -56,6 +56,8 @@ TRAIL_STOP_ATR_MULTIPLIER = Decimal("1.5")
 # 移动止损请求失败重试:次数与间隔(秒);-2011 视为取消成功
 MOVE_STOP_MAX_ATTEMPTS = 3
 MOVE_STOP_RETRY_DELAY = 1.0
+SNAPSHOT_MAX_ATTEMPTS = 3
+SNAPSHOT_RETRY_DELAY = 1.0
 
 LOGGER = get_logger("position_monitor")
 
@@ -75,6 +77,15 @@ def get_active_monitor() -> "PositionMonitor | None":
 
 def _ledger_path(environment: str) -> Path:
     return runtime_directory(environment) / POSITION_STATE_FILENAME
+
+
+def position_key(symbol: Any, position_side: Any = "BOTH") -> str:
+    """返回程序仓位的稳定键。
+
+    Binance 在对冲模式下会为同一 symbol 返回 LONG/SHORT 两条独立记录，
+    因此禁止再用 symbol 作为本地台账与对账键。
+    """
+    return f"{str(symbol or '')}|{str(position_side or 'BOTH')}"
 
 
 def _read_positions_unlocked(path: Path) -> list[dict[str, Any]]:
@@ -110,33 +121,43 @@ def load_positions(environment: str) -> list[dict[str, Any]]:
 
 
 def add_position(environment: str, record: dict[str, Any]) -> None:
-    """登记本地持仓(同 symbol 覆盖,线程安全)。"""
+    """登记本地持仓(同 symbol+positionSide 覆盖,线程安全)。"""
     with _LEDGER_LOCK:
         path = _ledger_path(environment)
         positions = _read_positions_unlocked(path)
-        positions = [item for item in positions if item.get("symbol") != record.get("symbol")]
+        key = position_key(record.get("symbol"), record.get("positionSide"))
+        record = {**record, "positionSide": str(record.get("positionSide") or "BOTH"), "positionKey": key}
+        positions = [
+            item for item in positions
+            if position_key(item.get("symbol"), item.get("positionSide")) != key
+        ]
         positions.append(record)
         _write_positions_unlocked(environment, positions)
 
 
-def update_position(environment: str, symbol: str, **fields: Any) -> None:
+def update_position(environment: str, symbol: str, position_side: str = "BOTH", **fields: Any) -> None:
     """更新本地持仓字段(线程安全)。"""
     with _LEDGER_LOCK:
         path = _ledger_path(environment)
         positions = _read_positions_unlocked(path)
+        key = position_key(symbol, position_side)
         for item in positions:
-            if item.get("symbol") == symbol:
+            if position_key(item.get("symbol"), item.get("positionSide")) == key:
                 item.update(fields)
                 break
         _write_positions_unlocked(environment, positions)
 
 
-def remove_position(environment: str, symbol: str) -> None:
+def remove_position(environment: str, symbol: str, position_side: str = "BOTH") -> None:
     """删除本地持仓记录(线程安全)。"""
     with _LEDGER_LOCK:
         path = _ledger_path(environment)
         positions = _read_positions_unlocked(path)
-        remaining = [item for item in positions if item.get("symbol") != symbol]
+        key = position_key(symbol, position_side)
+        remaining = [
+            item for item in positions
+            if position_key(item.get("symbol"), item.get("positionSide")) != key
+        ]
         if len(remaining) != len(positions):
             _write_positions_unlocked(environment, remaining)
 
@@ -194,6 +215,8 @@ class PositionMonitor:
         self._last_renew = started_at
         self._last_atr = started_at
         self._last_pnl_refresh = started_at
+        # 只有该时点后的完整 positionRisk 快照才可参与风险动作；网络失败绝不清空旧状态。
+        self._last_successful_snapshot = 0.0
 
     def _build_client(self) -> BinanceFuturesClient:
         """按环境读取密钥并构建签名客户端。"""
@@ -302,8 +325,13 @@ class PositionMonitor:
     # ---- WebSocket 回调(接收线程,仅入队) ----
 
     def _on_account_event(self, payload: dict[str, Any]) -> None:
-        if payload.get("e") == "ACCOUNT_UPDATE":
+        event_type = payload.get("e")
+        if event_type == "ACCOUNT_UPDATE":
             self._queue.put(("account", payload))
+        elif event_type in {"ORDER_TRADE_UPDATE", "ALGO_UPDATE", "listenKeyExpired"}:
+            # 订单/条件单状态变更及 listenKey 失效均要求用 REST 完整对账；
+            # 不依据网络事件缺失直接清理程序仓位。
+            self._queue.put(("snapshot", None))
 
     def _on_mark_event(self, payload: dict[str, Any]) -> None:
         """全市场标记价格流回调(接收线程,仅入队)。
@@ -312,11 +340,10 @@ class PositionMonitor:
         data 是数组,每轮含全量推送(全部交易对)与增量推送(仅价格变更交易对),
         对每个元素按交易对过滤后处理;未出现在本轮推送中的交易对保持原值。
         """
-        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        if isinstance(payload, dict) and "data" in payload:
             payload = payload["data"]
-        if not isinstance(payload, list):
-            return
-        for item in payload:
+        items = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+        for item in items:
             if not isinstance(item, dict) or item.get("e") != "markPriceUpdate":
                 continue
             symbol = item.get("s")
@@ -327,10 +354,10 @@ class PositionMonitor:
             if not isinstance(symbol, str) or not math.isfinite(mark):
                 continue
             # 实时更新快照 markPrice 与更新时间(GUI 依据 updatedAt 逐秒重建盈亏展示)
-            position = self._account_positions.get(symbol)
-            if position is not None:
-                position["markPrice"] = mark
-                self._snapshot_updated_at = time.monotonic()
+            for position in self._account_positions.values():
+                if position.get("symbol") == symbol:
+                    position["markPrice"] = mark
+                    self._snapshot_updated_at = time.monotonic()
             # 仅移动止损的突破仓位入队(其余交易对只更新快照,不触发本地持仓文件读取)
             if symbol not in self._mark_symbols:
                 continue
@@ -364,9 +391,6 @@ class PositionMonitor:
                     }
         positions = account.get("P")
         if isinstance(positions, list):
-            # 对冲模式同一 symbol 会返回 LONG/SHORT 两条记录,
-            # 同事件内按 symbol 汇总净额后整体覆盖,避免逐条覆盖导致互相清零
-            seen: set[str] = set()
             for item in positions:
                 if not isinstance(item, dict):
                     continue
@@ -377,110 +401,125 @@ class PositionMonitor:
                     unrealized = float(item.get("up"))
                 except (TypeError, ValueError):
                     continue
+                side = str(item.get("ps") or "BOTH")
                 if not isinstance(symbol, str) or not math.isfinite(amount):
                     continue
-                if symbol not in seen:
-                    seen.add(symbol)
-                    self._exchange_positions[symbol] = 0.0
-                    self._exchange_position_strs[symbol] = Decimal("0")
-                self._exchange_positions[symbol] += amount
-                # pa 为交易所原始数量字符串,Decimal 加总保真,供 GUI 平仓下单直接使用(避免 float 精度丢失)
-                self._exchange_position_strs[symbol] += _decimal_of(item.get("pa")) or Decimal("0")
-                net_amount = self._exchange_position_strs[symbol]
-                previous = self._account_positions.get(symbol, {})
-                # 明细以非零(主持仓)侧记录为准;归零事件同样同步净额,避免快照残留旧仓位
-                if abs(amount) > 0 or symbol not in self._account_positions:
-                    self._account_positions[symbol] = {
-                        "positionSide": str(item.get("ps", "BOTH")),
-                        "positionAmt": float(net_amount),
-                        "positionAmtStr": format(net_amount, "f"),
-                        "entryPrice": entry if math.isfinite(entry) else previous.get("entryPrice", 0.0),
-                        "markPrice": previous.get("markPrice", 0.0),
-                        "unrealizedProfit": unrealized if math.isfinite(unrealized) else previous.get("unrealizedProfit", 0.0),
-                        "leverage": previous.get("leverage", 1),
-                    }
-                else:
-                    self._account_positions[symbol]["positionAmt"] = float(net_amount)
-                    self._account_positions[symbol]["positionAmtStr"] = format(net_amount, "f")
+                key = position_key(symbol, side)
+                quantity = _decimal_of(item.get("pa")) or Decimal("0")
+                # ACCOUNT_UPDATE 只推送发生变化的方向，不能把未出现的另一方向归零。
+                self._exchange_positions[key] = amount
+                self._exchange_position_strs[key] = quantity
+                previous = self._account_positions.get(key, {})
+                self._account_positions[key] = {
+                    "symbol": symbol,
+                    "positionSide": side,
+                    "positionAmt": amount,
+                    "positionAmtStr": format(quantity, "f"),
+                    "entryPrice": entry if math.isfinite(entry) else previous.get("entryPrice", 0.0),
+                    "markPrice": previous.get("markPrice", 0.0),
+                    "unrealizedProfit": unrealized if math.isfinite(unrealized) else previous.get("unrealizedProfit", 0.0),
+                    "leverage": previous.get("leverage", 1),
+                }
         self._snapshot_updated_at = time.monotonic()
 
     def _full_snapshot(self) -> None:
         """positionRisk 全量快照覆盖持仓状态,并触发对齐(断线/丢事件兜底)。"""
         self._last_snapshot = time.monotonic()
-        try:
-            self._exchange_positions = {}
-            self._exchange_position_strs = {}
-            self._account_positions = {}
-            # v3 positionRisk 移除了 leverage 配置字段:
-            # 优先 symbolConfig(用户配置过的 symbol),其次本地持仓开仓时记录的有效杠杆
-            leverage_map = self._client.get_leverage_map()
+        last_error: Exception | None = None
+        for attempt in range(1, SNAPSHOT_MAX_ATTEMPTS + 1):
+            try:
+                # 先完整取得数据到候选快照，任一请求失败均不污染正在使用的状态。
+                leverage_map = self._client.get_leverage_map()
+                raw_positions = self._client.get_positions_detail()
+                balance = self._client.get_balance_usdt()
+                wallet = self._client.get_wallet_balance_usdt()
+            except Exception as exc:
+                last_error = exc
+                if attempt < SNAPSHOT_MAX_ATTEMPTS:
+                    self.logger.warning("持仓快照查询失败(第 %s/%s 次),稍后重试: %s", attempt, SNAPSHOT_MAX_ATTEMPTS, exc)
+                    time.sleep(SNAPSHOT_RETRY_DELAY * attempt)
+                continue
+            candidate_positions: dict[str, float] = {}
+            candidate_position_strs: dict[str, Decimal] = {}
+            candidate_account_positions: dict[str, dict[str, Any]] = {}
             local_leverage = {
-                position.get("symbol"): position.get("leverage")
+                position_key(position.get("symbol"), position.get("positionSide")): position.get("leverage")
                 for position in load_positions(self.config.environment)
             }
-            # 对冲模式同一 symbol 返回 LONG/SHORT 两条,按 symbol 汇总净额
-            seen: set[str] = set()
-            for item in self._client.get_positions_detail():
+            for item in raw_positions:
                 symbol = item.get("symbol")
                 try:
                     amount = float(item.get("positionAmt"))
                 except (TypeError, ValueError):
                     continue
+                side = str(item.get("positionSide") or "BOTH")
                 if not isinstance(symbol, str) or not math.isfinite(amount):
                     continue
-                if symbol not in seen:
-                    seen.add(symbol)
-                    self._exchange_positions[symbol] = 0.0
-                    self._exchange_position_strs[symbol] = Decimal("0")
-                self._exchange_positions[symbol] += amount
-                # positionAmt 为交易所原始数量字符串,Decimal 加总保真,供 GUI 平仓下单直接使用
-                self._exchange_position_strs[symbol] += _decimal_of(item.get("positionAmt")) or Decimal("0")
-                net_amount = self._exchange_position_strs[symbol]
-                if abs(amount) > 0 or symbol not in self._account_positions:
-                    self._account_positions[symbol] = {
-                        "positionSide": str(item.get("positionSide", "BOTH")),
-                        "positionAmt": float(net_amount),
-                        "positionAmtStr": format(net_amount, "f"),
-                        "entryPrice": _safe_float(item.get("entryPrice")),
-                        "markPrice": _safe_float(item.get("markPrice")),
-                        "unrealizedProfit": _safe_float(item.get("unrealizedProfit")),
-                        "leverage": leverage_map.get(symbol) or local_leverage.get(symbol) or 0,
-                    }
-                else:
-                    self._account_positions[symbol]["positionAmt"] = float(net_amount)
-                    self._account_positions[symbol]["positionAmtStr"] = format(net_amount, "f")
-            try:
-                usdt = self._account_balances.setdefault("USDT", {})
-                usdt["availableBalance"] = self._client.get_balance_usdt()
-                # 钱包余额:账户盈亏百分比的分母基准,启动快照即初始化,
-                # 不再依赖 ACCOUNT_UPDATE 事件或 30 秒 WS API 校准才出现
-                usdt["balance"] = self._client.get_wallet_balance_usdt()
-            except Exception as exc:
-                self.logger.warning("余额快照刷新失败: %s", exc)
+                key = position_key(symbol, side)
+                quantity = _decimal_of(item.get("positionAmt")) or Decimal("0")
+                candidate_positions[key] = amount
+                candidate_position_strs[key] = quantity
+                candidate_account_positions[key] = {
+                    "symbol": symbol, "positionSide": side, "positionAmt": amount,
+                    "positionAmtStr": format(quantity, "f"),
+                    "entryPrice": _safe_float(item.get("entryPrice")),
+                    "markPrice": _safe_float(item.get("markPrice")),
+                    "unrealizedProfit": _safe_float(item.get("unrealizedProfit")),
+                    "leverage": leverage_map.get(symbol) or local_leverage.get(key) or 0,
+                }
+            self._exchange_positions = candidate_positions
+            self._exchange_position_strs = candidate_position_strs
+            self._account_positions = candidate_account_positions
+            usdt = self._account_balances.setdefault("USDT", {})
+            usdt["availableBalance"] = balance
+            usdt["balance"] = wallet
             self._snapshot_updated_at = time.monotonic()
-        except Exception as exc:
-            self.logger.warning("持仓快照刷新失败,沿用上次状态: %s", exc)
+            self._last_successful_snapshot = self._snapshot_updated_at
+            self._reconcile()
             return
-        self._reconcile()
+        self.logger.warning("持仓快照连续失败,沿用上次成功状态 attempts=%s: %s", SNAPSHOT_MAX_ATTEMPTS, last_error)
 
     def get_account_snapshot(self) -> dict[str, Any]:
-        """返回账户快照副本(GUI 线程只读,持仓监控器线程维护)。"""
+        """返回仅包含程序登记仓位的账户快照(GUI 线程只读)。"""
+        managed = {
+            position_key(item.get("symbol"), item.get("positionSide")): item
+            for item in load_positions(self.config.environment)
+        }
         return {
             "balances": {asset: dict(info) for asset, info in self._account_balances.items()},
-            "positions": {symbol: dict(info) for symbol, info in self._account_positions.items()},
+            "positions": {
+                key: {**dict(info), "managed": True, "local": dict(managed[key])}
+                for key, info in self._account_positions.items() if key in managed
+            },
             "updatedAt": self._snapshot_updated_at,
         }
 
     def _reconcile(self) -> None:
         """对齐:本地有而交易所无的仓位视为幽灵,清理本地并取消残留挂单。"""
         for position in load_positions(self.config.environment):
-            symbol = position.get("symbol")
-            amount = self._exchange_positions.get(str(symbol), 0.0)
-            if abs(amount) > 0:
-                continue  # 本地 ∧ 交易所:正常监控(突破移动止损由 mark 事件驱动)
-            self._cleanup_phantom(position)
+            key = position_key(position.get("symbol"), position.get("positionSide"))
+            amount = self._exchange_positions.get(key)
+            expected = _decimal_of(position.get("quantity"))
+            # 本轮完整 V3 快照成功后，未返回该键等同该方向无持仓；查询失败时本函数不会执行。
+            if amount is None:
+                self._cleanup_phantom(position)
+                continue
+            if abs(amount) == 0:
+                self._cleanup_phantom(position)
+                continue
+            if expected is not None and abs(abs(Decimal(str(amount))) - abs(expected)) > Decimal("0.00000001"):
+                self._mark_conflict(position, f"交易所数量 {amount} 与程序登记数量 {expected} 不一致")
+                continue
+            if position.get("status") == "conflict":
+                update_position(self.config.environment, str(position.get("symbol")), str(position.get("positionSide") or "BOTH"), status="active", conflictReason=None)
         # 持仓状态变化后刷新移动止损跟踪集合(全市场流只做内存过滤,无需重建连接)
         self._refresh_mark_symbols()
+
+    def _mark_conflict(self, position: dict[str, Any], reason: str) -> None:
+        """标记外部干预冲突；冲突仓位不再被自动撤单、移动止损或平仓。"""
+        if position.get("status") != "conflict" or position.get("conflictReason") != reason:
+            self.logger.error("程序仓位进入冲突保护 symbol=%s side=%s: %s", position.get("symbol"), position.get("positionSide"), reason)
+            update_position(self.config.environment, str(position.get("symbol")), str(position.get("positionSide") or "BOTH"), status="conflict", conflictReason=reason, conflictAt=datetime.now(timezone.utc).isoformat())
 
     def _log_cancel_outcome(self, label: str, symbol: str, order_id: Any, exc: Exception) -> None:
         """记录撤单结果:订单已不存在(-2011,可能已被成交/取消)降为 INFO,其余保持 WARNING。"""
@@ -527,7 +566,7 @@ class PositionMonitor:
         except Exception as exc:
             self.logger.warning("平仓盈亏记录失败,保留本地记录待下轮重试 symbol=%s: %s", symbol, exc)
             return
-        remove_position(self.config.environment, symbol)
+        remove_position(self.config.environment, symbol, str(position.get("positionSide") or "BOTH"))
         self.logger.info("幽灵持仓已清理 symbol=%s", symbol)
 
     def _record_position_pnl(self, position: dict[str, Any], tp_missing: bool, stop_missing: bool) -> None:
@@ -673,8 +712,10 @@ class PositionMonitor:
         self._mark_symbols = {
             item["symbol"]
             for item in load_positions(self.config.environment)
-            if item.get("signalType") in TRAILED_SIGNALS
+            if item.get("signalType") in TRAILED_SIGNALS and item.get("status", "active") == "active"
         }
+        if self._mark_stream is not None:
+            self._mark_stream.set_symbols(self._mark_symbols)
 
     # ---- 移动止损 ----
 
@@ -684,8 +725,22 @@ class PositionMonitor:
         多仓(上破):mark 累计上移 1R 抬升一档,止损 = mark − R − ATR;
         空仓(下破):mark 累计下移 1R 抬升一档,止损 = mark + |R| + ATR。
         """
-        position = self._find_position(symbol)
-        if position is None or position.get("signalType") not in TRAILED_SIGNALS:
+        positions = [
+            item for item in load_positions(self.config.environment)
+            if item.get("symbol") == symbol
+            and item.get("signalType") in TRAILED_SIGNALS
+            and item.get("status", "active") == "active"
+        ]
+        for position in positions:
+            self._check_trailing_position(position, symbol, mark)
+
+    def _check_trailing_position(self, position: dict[str, Any], symbol: str, mark: float) -> None:
+        """对单条已确认归属的突破仓位执行 R 阶止损检查。"""
+        actual_amount = self._exchange_positions.get(
+            position_key(symbol, position.get("positionSide"))
+        )
+        if actual_amount is None or abs(actual_amount) == 0:
+            # 账户事件已表明仓位不存在/状态未知时，不得再撤换保护单；等待完整快照对账。
             return
         is_long = str(position.get("direction", "")) == "多"
         mark_decimal = Decimal(str(mark))
@@ -787,9 +842,8 @@ class PositionMonitor:
         因此必须先取消旧单再挂新单;各步骤先有限次重试(-2011 视为取消成功),
         完全失败才走对应处理:取消失败保留原止损、挂新单失败用原止损价恢复保护。
         """
-        position_side = None
-        if self._client.is_dual_side_position():
-            position_side = "LONG" if position.get("direction") == "多" else "SHORT"
+        stored_side = str(position.get("positionSide") or "BOTH")
+        position_side = stored_side if stored_side in {"LONG", "SHORT"} else None
         stop_side = "SELL" if position.get("direction") == "多" else "BUY"
         old_algo_id = position.get("stopAlgoId")
         if old_algo_id:
@@ -809,12 +863,13 @@ class PositionMonitor:
             if restore_order is None:
                 self.logger.error("移动止损:恢复原止损失败,仓位无保护! symbol=%s", symbol)
                 return
-            update_position(self.config.environment, symbol, stopAlgoId=restore_order.get("algoId"))
+            update_position(self.config.environment, symbol, str(position.get("positionSide") or "BOTH"), stopAlgoId=restore_order.get("algoId"))
             self.logger.warning("移动止损:已用原止损价恢复保护 symbol=%s stop=%s", symbol, position["currentStop"])
             return
         update_position(
             self.config.environment,
             symbol,
+            str(position.get("positionSide") or "BOTH"),
             currentStop=float(new_stop),
             stopAlgoId=stop_order.get("algoId"),
             trailLevel=new_level,
@@ -825,9 +880,9 @@ class PositionMonitor:
             symbol, new_level, new_stop, mark, stop_order.get("algoId"),
         )
 
-    def _find_position(self, symbol: str) -> dict[str, Any] | None:
+    def _find_position(self, symbol: str, position_side: str = "BOTH") -> dict[str, Any] | None:
         for item in load_positions(self.config.environment):
-            if item.get("symbol") == symbol:
+            if position_key(item.get("symbol"), item.get("positionSide")) == position_key(symbol, position_side):
                 return item
         return None
 
@@ -866,17 +921,22 @@ class PositionMonitor:
         权威值),不手工用 (标记价−开仓价)×数量 计算——避免对冲模式多空
         记录覆盖开仓价、快照数据异常导致浮盈虚高误触发。
         """
+        # 超过一个全量快照周期仍未成功刷新时，禁止使用旧数据触发任何全平动作。
+        if time.monotonic() - self._last_successful_snapshot > FULL_SNAPSHOT_SECONDS:
+            self.logger.warning("账户快照已过期,跳过自动全平判断")
+            return None
         usdt = self._account_balances.get("USDT", {})
         wallet = float(usdt.get("balance", 0.0))
         if wallet <= 0:
             return None
-        ledger_symbols = {
-            str(position.get("symbol"))
+        ledger_keys = {
+            position_key(position.get("symbol"), position.get("positionSide"))
             for position in load_positions(self.config.environment)
+            if position.get("status", "active") == "active"
         }
         unrealized = 0.0
-        for symbol, info in self._account_positions.items():
-            if symbol not in ledger_symbols:
+        for key, info in self._account_positions.items():
+            if key not in ledger_keys:
                 continue  # 非程序仓(手动开仓)不计入触发判断
             unrealized += float(info.get("unrealizedProfit", 0.0))
         return unrealized / wallet * 100
@@ -893,14 +953,15 @@ class PositionMonitor:
             return
         if pct >= self._auto_close_profit_pct or pct <= -self._auto_close_loss_pct:
             # 触发明细:记录各程序仓的官方未实现盈亏,便于核对触发是否合理
-            ledger_symbols = {
-                str(position.get("symbol"))
+            ledger_keys = {
+                position_key(position.get("symbol"), position.get("positionSide"))
                 for position in load_positions(self.config.environment)
+                if position.get("status", "active") == "active"
             }
             detail = ", ".join(
-                f"{symbol}:amt={info.get('positionAmt')} upnl={info.get('unrealizedProfit')}"
-                for symbol, info in sorted(self._account_positions.items())
-                if symbol in ledger_symbols
+                f"{info.get('symbol')}/{info.get('positionSide')}:amt={info.get('positionAmt')} upnl={info.get('unrealizedProfit')}"
+                for key, info in sorted(self._account_positions.items())
+                if key in ledger_keys
             )
             self.logger.warning(
                 "盈亏自动全平触发 pnl=%+.2f%% 盈利阈值=%s%% 亏损阈值=%s%% 明细: %s",
@@ -918,17 +979,19 @@ class PositionMonitor:
         self._auto_closing = True
         try:
             dual = self._client.is_dual_side_position()
-            ledger_symbols = {
-                str(position.get("symbol"))
+            managed = {
+                position_key(position.get("symbol"), position.get("positionSide")): position
                 for position in load_positions(self.config.environment)
+                if position.get("status", "active") == "active"
             }
             closed = 0
             for item in self._client.get_positions_detail():
                 symbol = item.get("symbol")
+                side_key = position_key(symbol, item.get("positionSide"))
                 amount_decimal = _decimal_of(item.get("positionAmt"))
                 if (
                     not isinstance(symbol, str)
-                    or symbol not in ledger_symbols
+                    or side_key not in managed
                     or amount_decimal is None
                     or amount_decimal == 0
                 ):
@@ -937,7 +1000,7 @@ class PositionMonitor:
                 quantity = format(abs(amount_decimal), "f")
                 # 对冲模式带与持仓方向一致的 positionSide;单向模式带 reduceOnly 防反向开仓
                 if dual:
-                    self._client.place_market_order(symbol, side, quantity, "LONG" if amount_decimal > 0 else "SHORT")
+                    self._client.place_market_order(symbol, side, quantity, str(item.get("positionSide") or "BOTH"))
                 else:
                     self._client.place_market_order(symbol, side, quantity, None, reduce_only=True)
                 self.logger.info("盈亏自动全平:已平 symbol=%s %s %s", symbol, side, quantity)

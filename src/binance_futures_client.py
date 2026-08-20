@@ -153,10 +153,10 @@ class BinanceFuturesClient:
         return 0.0
 
     def get_position_risk(self) -> dict[str, float]:
-        """查询全部持仓数量(/fapi/v2/positionRisk),返回 symbol → 合计持仓量。
+        """查询全部持仓数量(/fapi/v3/positionRisk),返回 symbol → 持仓绝对量。
 
-        对冲模式下同一 symbol 可能返回多空两条记录,此处按 symbol 求和,
-        供执行器判断"是否已有持仓"。
+        对冲模式下同一 symbol 可能同时有 LONG/SHORT；执行器只需判断是否已有
+        任一方向仓位，因此累计绝对量，禁止多空抵消后误判为无仓。
         """
         payload = self._signed_request("GET", POSITION_RISK_PATH, {})
         if not isinstance(payload, list):
@@ -171,7 +171,7 @@ class BinanceFuturesClient:
             except (TypeError, ValueError):
                 continue
             if isinstance(symbol, str) and math.isfinite(amount):
-                positions[symbol] = positions.get(symbol, 0.0) + amount
+                positions[symbol] = positions.get(symbol, 0.0) + abs(amount)
         return positions
 
     def get_positions_detail(self) -> list[dict[str, Any]]:
@@ -228,7 +228,7 @@ class BinanceFuturesClient:
         payload = self._signed_request("GET", ALGO_ORDER_PATH, {"symbol": symbol, "algoId": algo_id})
         return payload if isinstance(payload, dict) else {}
 
-    def get_position(self, symbol: str) -> dict[str, Any] | None:
+    def get_position(self, symbol: str, position_side: str | None = None) -> dict[str, Any] | None:
         """查询指定交易对当前持仓记录(/fapi/v2/positionRisk?symbol=X)。
 
         对冲模式下同一 symbol 可能返回多空两条记录,取非零持仓那条;
@@ -239,6 +239,8 @@ class BinanceFuturesClient:
             raise RuntimeError("持仓信息响应格式无效。")
         for item in payload:
             if not isinstance(item, dict) or item.get("symbol") != symbol:
+                continue
+            if position_side is not None and item.get("positionSide") != position_side:
                 continue
             try:
                 amount = float(item.get("positionAmt"))

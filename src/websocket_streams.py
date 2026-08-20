@@ -191,7 +191,7 @@ class _ReconnectingStream(threading.Thread):
 
 
 class UserDataStream(_ReconnectingStream):
-    """Private 用户数据流:订阅 listenKey 的 ACCOUNT_UPDATE 事件(持仓变化)。"""
+    """Private 用户数据流:接收账户、订单及条件单状态事件。"""
 
     def __init__(self, use_testnet: bool, listen_key: str, proxy_url: str | None,
                  on_message: Callable[[dict[str, Any]], None]) -> None:
@@ -200,18 +200,15 @@ class UserDataStream(_ReconnectingStream):
         self._listen_key = listen_key
 
     def _build_url(self) -> str:
-        # 官方示例: wss://fstream.binance.com/private/ws?listenKey=<key>&events=ACCOUNT_UPDATE
-        return (
-            f"{get_websocket_base_url(self._use_testnet)}/private/ws"
-            f"?listenKey={self._listen_key}&events=ACCOUNT_UPDATE"
-        )
+        # 官方 User Data Stream 示例: /private/ws/<listenKey>，该连接推送全部私有事件。
+        return f"{get_websocket_base_url(self._use_testnet)}/private/ws/{self._listen_key}"
 
     def _symbols_snapshot(self) -> list[str]:
         return [self._listen_key]
 
 
 class MarkPriceStream(_ReconnectingStream):
-    """Market 全市场标记价格流:一次订阅全部交易对,不再按交易对逐个订阅。
+    """Market 标记价格流:仅订阅执行 R 阶移动止损的程序仓位。
 
     官方文档(AGENTS.md 登记):
     - All Market Mark Price Stream: !markPrice@arr(约 3 秒全量推送一轮,期间
@@ -223,22 +220,31 @@ class MarkPriceStream(_ReconnectingStream):
     - 文档: https://developers.binance.com/legacy-docs/derivatives/usds-margined-futures/websocket-market-streams
     """
 
-    ALL_MARKET_MARK_PRICE_STREAM = "!markPrice@arr"
-
     def __init__(self, use_testnet: bool, proxy_url: str | None,
                  on_message: Callable[[dict[str, Any]], None]) -> None:
         super().__init__("mark-price", proxy_url, on_message)
         self._use_testnet = use_testnet
+        self._subscription_lock = threading.Lock()
+        self._symbols: set[str] = set()
+
+    def set_symbols(self, symbols: set[str]) -> None:
+        """更新程序突破仓位订阅；无仓位时不建立市场连接。"""
+        normalized = {symbol.lower() for symbol in symbols if symbol}
+        with self._subscription_lock:
+            changed = normalized != self._symbols
+            self._symbols = normalized
+        if changed:
+            self.request_rebuild()
 
     def _symbols_snapshot(self) -> list[str]:
-        # 全市场流不依赖交易对订阅:恒返回非空,保证重连循环持续连接
-        return [self.ALL_MARKET_MARK_PRICE_STREAM]
+        with self._subscription_lock:
+            return [f"{symbol}@markPrice@1s" for symbol in sorted(self._symbols)]
 
     def _build_url(self) -> str:
-        # 官方示例: wss://fstream.binance.com/market/stream?streams=!markPrice@arr
+        streams = "/".join(self._symbols_snapshot())
         return (
             f"{get_websocket_base_url(self._use_testnet)}/market/stream"
-            f"?streams={self.ALL_MARKET_MARK_PRICE_STREAM}"
+            f"?streams={streams}"
         )
 
 

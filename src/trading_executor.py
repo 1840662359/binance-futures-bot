@@ -405,6 +405,9 @@ class TradingExecutor:
         order = record.get("order") if isinstance(record.get("order"), dict) else {}
         add_position(self.config.environment, {
             "symbol": record.get("symbol"),
+            # 单向模式明确保存 BOTH；对冲模式保存交易所回执中的 LONG/SHORT。
+            "positionSide": str(order.get("positionSide") or "BOTH"),
+            "status": "active",
             "signalType": record.get("signalType"),
             "direction": record.get("direction"),
             "entryPrice": entry,
@@ -637,7 +640,7 @@ class TradingExecutor:
 
         # 开仓回报可能缺少成交价与数量(测试网实测),直接重新查询账户真实持仓,
         # 以持仓记录的开仓均价与数量为准
-        position = self._query_position_after_order(client, symbol)
+        position = self._query_position_after_order(client, symbol, position_side)
         if position is None:
             note = self._close_position(
                 client, symbol, side, _decimal(order.get("executedQty")), position_side, reduce_only
@@ -717,12 +720,12 @@ class TradingExecutor:
         return {**computed, "status": "filled", "summaryKey": "executed"}
 
     def _query_position_after_order(
-        self, client: BinanceFuturesClient, symbol: str
+        self, client: BinanceFuturesClient, symbol: str, position_side: str | None
     ) -> dict[str, Any] | None:
         """开仓后查询账户真实持仓;撮合结果可能稍后可见,重试一次。"""
         for attempt in range(2):
             try:
-                position = client.get_position(symbol)
+                position = client.get_position(symbol, position_side)
             except Exception as exc:
                 self.logger.warning("查询持仓失败 symbol=%s: %s", symbol, exc)
                 return None
