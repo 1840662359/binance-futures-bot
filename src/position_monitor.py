@@ -6,11 +6,12 @@
 - 其它情况一律忽略、不监控;
 - 高抛低吸仓位:仅存在性监控,不动止盈止损挂单;
 - 上破/下破仓位(多空镜像):按 R 阶移动止损——R = 开仓价 − 初始止损(箱体中轨±缓冲),
-  多仓标记价格累计上移 1R 止损上移至「mark − R − 1h ATR(14)」,
-  空仓标记价格累计下移 1R 止损下移至「mark + |R| + 1h ATR(14)」,
+  多仓标记价格累计上移 1R 止损上移至「mark − R − 1.5×箱体周期 ATR(14)」,
+  空仓标记价格累计下移 1R 止损下移至「mark + |R| + 1.5×箱体周期 ATR(14)」,
   经 /fapi/v1/algoOrder 以 cancel+place 方式更新(官方明确未触发条件单不支持修改)。
 
-对齐数据源:Private 用户数据流(ACCOUNT_UPDATE)+ 每 5 分钟 positionRisk 全量快照兜底。
+对齐数据源:Private 用户数据流(ACCOUNT_UPDATE 仅触发)+ REST 权威快照确认；
+账户流断开时每 10 秒 REST 兜底，正常时保留每 5 分钟完整校验。
 标记价格流为 Market 全市场流 !markPrice@arr(一次订阅全部交易对,全量+增量交替推送),
 不再按交易对逐个订阅、不再因持仓变化重建连接。
 WebSocket Base URL 按官方 2026-04-23 迁移公告使用 {public|market|private} 新三入口。
@@ -37,7 +38,6 @@ from pnl_tracker import append_pnl_record
 from scheduler import SchedulerConfig
 from secret_utils import get_secret
 from websocket_streams import MarkPriceStream, UserDataStream
-from ws_api_client import WsApiClient
 
 # 程序当前持仓的可变列表；与只追加的开仓台账分离。
 PROGRAM_POSITIONS_FILENAME = "program_positions.json"
@@ -48,12 +48,11 @@ BREAKDOWN_SIGNAL = "下破箱体下沿"
 TRAILED_SIGNALS = frozenset({BREAKOUT_SIGNAL, BREAKDOWN_SIGNAL})
 FULL_SNAPSHOT_SECONDS = 300
 LISTEN_KEY_RENEW_SECONDS = 1800
-ATR_REFRESH_SECONDS = 1800
-# 官方盈亏校准间隔:展示层由 markPrice@1s 逐秒计算(插值),
-# 每 30 秒用 WS API v2/account.status 官方值校准(权重 10,消耗可接受)
-PNL_REFRESH_SECONDS = 30
+STREAM_FALLBACK_SECONDS = 10
+MARK_STALE_SECONDS = 5
+ACCOUNT_EVENT_DEBOUNCE_SECONDS = 0.25
 ATR_PERIOD = 14
-# 移动止损缓冲:1.5×ATR(1h),在容纳小时级正常波动与锁利回吐之间折中
+# 移动止损缓冲:1.5×箱体周期 ATR(14)，在容纳结构周期波动与锁利回吐之间折中
 TRAIL_STOP_ATR_MULTIPLIER = Decimal("1.5")
 # 移动止损请求失败重试:次数与间隔(秒);-2011 视为取消成功
 MOVE_STOP_MAX_ATTEMPTS = 3
@@ -168,6 +167,71 @@ def remove_position(environment: str, symbol: str, position_side: str = "BOTH") 
             _write_positions_unlocked(environment, remaining)
 
 
+class _TrailingPositionTask(threading.Thread):
+    """单个突破程序仓位的本地移动止损子任务。
+
+    子任务绝不自行建立行情 WebSocket；它只消费 PositionMonitor 共享的
+    全市场标记价格缓存。ATR 在该仓位所属箱体周期每次收盘后独立刷新。
+    """
+
+    def __init__(self, monitor: "PositionMonitor", key: str) -> None:
+        super().__init__(name=f"trail-{key}", daemon=True)
+        self._monitor = monitor
+        self._key = key
+        self._stop_task = threading.Event()
+        self._wake = threading.Event()
+        self._next_atr_refresh = 0.0
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def stop(self) -> None:
+        self._stop_task.set()
+        self._wake.set()
+        self.join(timeout=5)
+
+    def run(self) -> None:
+        self._refresh_atr()
+        while not self._stop_task.is_set() and not self._monitor._stop.is_set():
+            timeout = max(0.5, self._next_atr_refresh - time.monotonic())
+            self._wake.wait(timeout)
+            self._wake.clear()
+            if self._stop_task.is_set() or self._monitor._stop.is_set():
+                return
+            if time.monotonic() >= self._next_atr_refresh:
+                self._refresh_atr()
+            self._monitor._check_trailing_key(self._key)
+
+    def _refresh_atr(self) -> None:
+        """在最新已收盘箱体 K 线基础上刷新 ATR，并安排下次收盘后执行。"""
+        position = self._monitor._find_position_by_key(self._key)
+        if position is None:
+            return
+        interval = self._monitor.config.structure_interval
+        symbol = str(position.get("symbol") or "")
+        if symbol:
+            try:
+                klines, failures = fetch_klines_with_failures(
+                    [symbol], interval, ATR_PERIOD + 1,
+                    self._monitor.config.use_testnet,
+                    self._monitor.config.http_timeout_seconds,
+                )
+                raw_klines = klines.get(symbol, [])
+                candles = parse_candles(raw_klines)
+                if len(candles) >= ATR_PERIOD + 1:
+                    true_ranges = [
+                        max(candle[2] - candle[3], abs(candle[2] - previous[4]), abs(candle[3] - previous[4]))
+                        for candle, previous in zip(candles[1:], candles[:-1])
+                    ]
+                    self._monitor._atr[self._key] = Decimal(str(sum(true_ranges[-ATR_PERIOD:]) / ATR_PERIOD))
+                    self._monitor.logger.info("ATR 已刷新 key=%s interval=%s", self._key, interval)
+                elif failures:
+                    self._monitor.logger.warning("ATR 刷新失败 key=%s: %s", self._key, failures)
+            except Exception as exc:
+                self._monitor.logger.warning("ATR 刷新异常 key=%s: %s", self._key, exc)
+        self._next_atr_refresh = _next_interval_close_monotonic(interval)
+
+
 class PositionMonitor:
     """持仓监控器:WebSocket 对齐 + 幽灵清理 + 突破仓位移动止损。
 
@@ -182,15 +246,7 @@ class PositionMonitor:
         self._api_key = ""
         self._api_secret = ""
         self._client = self._build_client()
-        # WebSocket API 客户端:周期查询官方未实现盈亏(价格变动不触发 ACCOUNT_UPDATE);
-        # 传入已校准的时钟偏移,签名请求遇 -1021 时内部自动重新校准
-        self._ws_api = WsApiClient(
-            self._api_key,
-            self._api_secret,
-            self.config.use_testnet,
-            self.config.proxy_url if self.config.proxy_enabled else None,
-            time_offset_ms=self._client.time_offset_ms,
-        )
+        self._state_lock = threading.RLock()
         self._listen_key = ""
         self._user_stream: UserDataStream | None = None
         self._mark_stream: MarkPriceStream | None = None
@@ -199,12 +255,12 @@ class PositionMonitor:
         self._exchange_positions: dict[str, float] = {}
         # 交易所持仓数量的 Decimal 加总:{symbol: Decimal}(原始字符串保真,供 GUI 平仓下单使用)
         self._exchange_position_strs: dict[str, Decimal] = {}
-        # 最新标记价格:{symbol: float}
+        # 最新标记价格及其接收时刻；所有突破仓位共享该缓存。
         self._marks: dict[str, float] = {}
-        # 全市场标记价格流中需要入队处理的交易对集合(移动止损的突破仓位,内存过滤用)
-        self._mark_symbols: set[str] = set()
-        # 1h ATR(14):{symbol: Decimal}
+        self._mark_received_at: dict[str, float] = {}
+        # 每个突破程序仓位独立维护箱体周期 ATR(14)。
         self._atr: dict[str, Decimal] = {}
+        self._trail_tasks: dict[str, "_TrailingPositionTask"] = {}
         # 账户快照(GUI 账户持仓页只读):余额与持仓明细,由 ACCOUNT_UPDATE 增量 + positionRisk 全量维护
         self._account_balances: dict[str, dict[str, float]] = {}
         self._account_positions: dict[str, dict[str, float]] = {}
@@ -219,8 +275,11 @@ class PositionMonitor:
         started_at = time.monotonic()
         self._last_snapshot = started_at
         self._last_renew = started_at
-        self._last_atr = started_at
-        self._last_pnl_refresh = started_at
+        self._last_account_fallback = 0.0
+        self._last_mark_fallback = 0.0
+        self._account_reconcile_due = 0.0
+        self._user_stream_connected = False
+        self._mark_stream_connected = False
         # 只有该时点后的完整 positionRisk 快照才可参与风险动作；网络失败绝不清空旧状态。
         self._last_successful_snapshot = 0.0
 
@@ -244,18 +303,17 @@ class PositionMonitor:
         self.logger.info("listenKey 已创建 key=%s", self._listen_key[:8])
         proxy_url = self.config.proxy_url if self.config.proxy_enabled else None
         self._user_stream = UserDataStream(
-            self.config.use_testnet, self._listen_key, proxy_url, self._on_account_event
+            self.config.use_testnet, self._listen_key, proxy_url,
+            self._on_account_event, self._on_user_stream_connection,
         )
         # 全市场标记价格流:一次订阅全部交易对,无需按持仓维护订阅列表
         self._mark_stream = MarkPriceStream(
-            self.config.use_testnet, proxy_url, self._on_mark_event
+            self.config.use_testnet, proxy_url, self._on_mark_event, self._on_mark_stream_connection
         )
         self._user_stream.start()
         self._mark_stream.start()
         # 初始全量对齐(重连兜底与增量事件之前先建立基线)
         self._full_snapshot()
-        # 启动即刷新 ATR,保证移动止损首档触发时有数据可用
-        self._refresh_atr()
         self._thread = threading.Thread(target=self._run, name="position-monitor", daemon=True)
         self._thread.start()
         with _MONITOR_LOCK:
@@ -272,6 +330,7 @@ class PositionMonitor:
             self._mark_stream.stop()
         if self._thread is not None:
             self._thread.join(timeout=10)
+        self._stop_trailing_tasks()
         if self._listen_key:
             try:
                 self._client.close_listen_key(self._listen_key)
@@ -301,10 +360,18 @@ class PositionMonitor:
                     self._full_snapshot()
                 if now - self._last_renew >= LISTEN_KEY_RENEW_SECONDS:
                     self._renew_listen_key()
-                if now - self._last_atr >= ATR_REFRESH_SECONDS:
-                    self._refresh_atr()
-                if now - self._last_pnl_refresh >= PNL_REFRESH_SECONDS:
-                    self._refresh_pnl_from_ws_api()
+                if self._account_reconcile_due and now >= self._account_reconcile_due:
+                    self._account_reconcile_due = 0.0
+                    self._full_snapshot()
+                if not self._user_stream_connected and now - self._last_account_fallback >= STREAM_FALLBACK_SECONDS:
+                    self._last_account_fallback = now
+                    self.logger.warning("账户信息流不可用，执行 10 秒 REST 仓位兜底")
+                    self._full_snapshot()
+                    if self._user_stream is None:
+                        self._recreate_user_stream()
+                if self._mark_fallback_needed(now) and now - self._last_mark_fallback >= STREAM_FALLBACK_SECONDS:
+                    self._last_mark_fallback = now
+                    self._refresh_marks_from_rest()
                 if self._auto_close_enabled:
                     self._check_auto_close()
             except BaseException:
@@ -314,15 +381,18 @@ class PositionMonitor:
     def _handle_event(self, event: tuple[str, Any]) -> None:
         kind, payload = event
         if kind == "account":
-            self._apply_account_update(payload)
-            self._reconcile()
+            # 私有流只负责发现变动；状态写入必须等待 REST 权威快照确认。
+            self._account_reconcile_due = time.monotonic() + ACCOUNT_EVENT_DEBOUNCE_SECONDS
         elif kind == "mark":
-            symbol, mark = payload
-            self._marks[symbol] = mark
-            self._check_trailing(symbol, mark)
+            key = str(payload)
+            task = self._trail_tasks.get(key)
+            if task is not None:
+                task.wake()
         elif kind == "snapshot":
             # 外部(如 GUI 平仓完成)请求立即全量刷新快照,在监控线程内执行避免竞态
             self._full_snapshot()
+        elif kind == "listen_key_expired":
+            self._recreate_user_stream()
 
     def request_full_snapshot(self) -> None:
         """请求监控线程立即执行一次全量快照(positionRisk),供平仓等操作后快速同步。"""
@@ -334,10 +404,42 @@ class PositionMonitor:
         event_type = payload.get("e")
         if event_type == "ACCOUNT_UPDATE":
             self._queue.put(("account", payload))
-        elif event_type in {"ORDER_TRADE_UPDATE", "ALGO_UPDATE", "listenKeyExpired"}:
+        elif event_type in {"ORDER_TRADE_UPDATE", "ALGO_UPDATE"}:
             # 订单/条件单状态变更及 listenKey 失效均要求用 REST 完整对账；
             # 不依据网络事件缺失直接清理程序仓位。
             self._queue.put(("snapshot", None))
+        elif event_type == "listenKeyExpired":
+            self._queue.put(("listen_key_expired", None))
+
+    def _on_user_stream_connection(self, connected: bool) -> None:
+        self._user_stream_connected = connected
+        if connected:
+            # 重连成功后先全量 REST 补齐断线窗口，再停止兜底轮询。
+            self._queue.put(("snapshot", None))
+
+    def _on_mark_stream_connection(self, connected: bool) -> None:
+        self._mark_stream_connected = connected
+
+    def _recreate_user_stream(self) -> None:
+        """listenKey 失效后重建私有流；旧 key 不可无限重连使用。"""
+        self.logger.warning("listenKey 已失效，重建账户信息流")
+        old_stream = self._user_stream
+        if old_stream is not None:
+            old_stream.stop()
+        self._user_stream = None
+        try:
+            self._listen_key = self._client.create_listen_key()
+            proxy_url = self.config.proxy_url if self.config.proxy_enabled else None
+            self._user_stream = UserDataStream(
+                self.config.use_testnet, self._listen_key, proxy_url,
+                self._on_account_event, self._on_user_stream_connection,
+            )
+            self._user_stream.start()
+            self._user_stream_connected = False
+            self._full_snapshot()
+        except Exception as exc:
+            # 连接线程之外的创建失败由 10 秒 REST 兜底覆盖；续期循环会继续尝试。
+            self.logger.warning("重建账户信息流失败，继续 REST 兜底: %s", exc)
 
     def _on_mark_event(self, payload: dict[str, Any]) -> None:
         """全市场标记价格流回调(接收线程,仅入队)。
@@ -359,16 +461,18 @@ class PositionMonitor:
                 continue
             if not isinstance(symbol, str) or not math.isfinite(mark):
                 continue
-            # 实时更新快照 markPrice 与更新时间(GUI 依据 updatedAt 逐秒重建盈亏展示)
-            for position in self._account_positions.values():
-                if position.get("symbol") == symbol:
-                    position["markPrice"] = mark
-                    self._snapshot_updated_at = time.monotonic()
-            # 仅移动止损的突破仓位入队(其余交易对只更新快照,不触发本地持仓文件读取)
-            if symbol not in self._mark_symbols:
-                continue
-            self._marks[symbol] = mark
-            self._queue.put(("mark", (symbol, mark)))
+            received_at = time.monotonic()
+            with self._state_lock:
+                self._marks[symbol] = mark
+                self._mark_received_at[symbol] = received_at
+                for position in self._account_positions.values():
+                    if position.get("symbol") == symbol:
+                        position["markPrice"] = mark
+                self._snapshot_updated_at = received_at
+            # 一个 symbol 可有对冲双向仓位；只唤醒对应的本地子任务。
+            for key, task in tuple(self._trail_tasks.items()):
+                if key.split("|", 1)[0] == symbol:
+                    self._queue.put(("mark", key))
 
     # ---- 对齐 ----
 
@@ -435,10 +539,8 @@ class PositionMonitor:
         for attempt in range(1, SNAPSHOT_MAX_ATTEMPTS + 1):
             try:
                 # 先完整取得数据到候选快照，任一请求失败均不污染正在使用的状态。
-                leverage_map = self._client.get_leverage_map()
                 raw_positions = self._client.get_positions_detail()
-                balance = self._client.get_balance_usdt()
-                wallet = self._client.get_wallet_balance_usdt()
+                overview = self._client.get_account_overview()
             except Exception as exc:
                 last_error = exc
                 if attempt < SNAPSHOT_MAX_ATTEMPTS:
@@ -471,16 +573,24 @@ class PositionMonitor:
                     "entryPrice": _safe_float(item.get("entryPrice")),
                     "markPrice": _safe_float(item.get("markPrice")),
                     "unrealizedProfit": _safe_float(item.get("unrealizedProfit")),
-                    "leverage": leverage_map.get(symbol) or local_leverage.get(key) or 0,
+                    "leverage": local_leverage.get(key) or 0,
                 }
-            self._exchange_positions = candidate_positions
-            self._exchange_position_strs = candidate_position_strs
-            self._account_positions = candidate_account_positions
-            usdt = self._account_balances.setdefault("USDT", {})
-            usdt["availableBalance"] = balance
-            usdt["balance"] = wallet
-            self._snapshot_updated_at = time.monotonic()
-            self._last_successful_snapshot = self._snapshot_updated_at
+            wallet = _safe_float(overview.get("totalWalletBalance"))
+            available = _safe_float(overview.get("availableBalance"))
+            if wallet <= 0:
+                # 单资产账户异常响应时保持旧快照，不用保证金余额替代钱包余额。
+                self.logger.warning("账户钱包余额 totalWalletBalance 无效，沿用上次快照")
+                return
+            with self._state_lock:
+                self._exchange_positions = candidate_positions
+                self._exchange_position_strs = candidate_position_strs
+                self._account_positions = candidate_account_positions
+                usdt = self._account_balances.setdefault("USDT", {})
+                usdt["availableBalance"] = available
+                usdt["balance"] = wallet
+                usdt["totalUnrealizedProfit"] = _safe_float(overview.get("totalUnrealizedProfit"))
+                self._snapshot_updated_at = time.monotonic()
+                self._last_successful_snapshot = self._snapshot_updated_at
             self._reconcile()
             return
         self.logger.warning("持仓快照连续失败,沿用上次成功状态 attempts=%s: %s", SNAPSHOT_MAX_ATTEMPTS, last_error)
@@ -514,12 +624,19 @@ class PositionMonitor:
                 self._cleanup_phantom(position)
                 continue
             if expected is not None and abs(abs(Decimal(str(amount))) - abs(expected)) > Decimal("0.00000001"):
-                self._mark_conflict(position, f"交易所数量 {amount} 与程序登记数量 {expected} 不一致")
-                continue
+                # 交易所为权威来源。程序仓位被部分平仓后仍需继续监管，
+                # 仅更新可变持仓列表，绝不修改开仓初始台账。
+                update_position(
+                    self.config.environment, str(position.get("symbol")),
+                    str(position.get("positionSide") or "BOTH"),
+                    quantity=float(abs(Decimal(str(amount)))),
+                    reconciledAt=datetime.now(timezone.utc).isoformat(),
+                    reconciliationNote="数量按交易所权威快照更新",
+                )
             if position.get("status") == "conflict":
                 update_position(self.config.environment, str(position.get("symbol")), str(position.get("positionSide") or "BOTH"), status="active", conflictReason=None)
-        # 持仓状态变化后刷新移动止损跟踪集合(全市场流只做内存过滤,无需重建连接)
-        self._refresh_mark_symbols()
+        # 仅为本地有且交易所也有的突破仓位维持独立子任务。
+        self._sync_trailing_tasks()
 
     def _mark_conflict(self, position: dict[str, Any], reason: str) -> None:
         """标记外部干预冲突；冲突仓位不再被自动撤单、移动止损或平仓。"""
@@ -709,38 +826,53 @@ class PositionMonitor:
                 return None
         return None
 
-    def _refresh_mark_symbols(self) -> None:
-        """刷新全市场流中需要入队处理的交易对集合:本地台账中的受监管仓位(移动止损驱动)。
-
-        全市场标记价格流无需按交易对订阅重建连接,此处仅做内存过滤,
-        避免为无关交易对重复触发本地持仓文件的读取。
-        """
-        self._mark_symbols = {
-            item["symbol"]
+    def _sync_trailing_tasks(self) -> None:
+        """按本地列表与交易所权威快照创建/销毁突破仓位子任务。"""
+        eligible = {
+            position_key(item.get("symbol"), item.get("positionSide"))
             for item in load_positions(self.config.environment)
-            if item.get("signalType") in TRAILED_SIGNALS and item.get("status", "active") == "active"
+            if item.get("signalType") in TRAILED_SIGNALS
+            and item.get("status", "active") == "active"
+            and abs(self._exchange_positions.get(position_key(item.get("symbol"), item.get("positionSide")), 0.0)) > 0
         }
-        if self._mark_stream is not None:
-            self._mark_stream.set_symbols(self._mark_symbols)
+        for key in set(self._trail_tasks) - eligible:
+            self._trail_tasks.pop(key).stop()
+            self._atr.pop(key, None)
+        for key in eligible - set(self._trail_tasks):
+            task = _TrailingPositionTask(self, key)
+            self._trail_tasks[key] = task
+            task.start()
+
+    def _stop_trailing_tasks(self) -> None:
+        for task in tuple(self._trail_tasks.values()):
+            task.stop()
+        self._trail_tasks.clear()
 
     # ---- 移动止损 ----
 
-    def _check_trailing(self, symbol: str, mark: float) -> None:
-        """受监管仓位 R 阶移动止损(多空镜像)。
+    def _find_position_by_key(self, key: str) -> dict[str, Any] | None:
+        for item in load_positions(self.config.environment):
+            if position_key(item.get("symbol"), item.get("positionSide")) == key:
+                return item
+        return None
 
-        多仓(上破):mark 累计上移 1R 抬升一档,止损 = mark − R − ATR;
-        空仓(下破):mark 累计下移 1R 抬升一档,止损 = mark + |R| + ATR。
-        """
-        positions = [
-            item for item in load_positions(self.config.environment)
-            if item.get("symbol") == symbol
-            and item.get("signalType") in TRAILED_SIGNALS
-            and item.get("status", "active") == "active"
-        ]
-        for position in positions:
-            self._check_trailing_position(position, symbol, mark)
+    def _check_trailing_key(self, key: str) -> None:
+        """由单仓位子任务消费共享行情缓存，并判断该仓位的 R 阶止损。"""
+        position = self._find_position_by_key(key)
+        if (
+            position is None
+            or position.get("signalType") not in TRAILED_SIGNALS
+            or position.get("status", "active") != "active"
+        ):
+            return
+        symbol = str(position.get("symbol") or "")
+        with self._state_lock:
+            mark = self._marks.get(symbol)
+        if mark is None:
+            return
+        self._check_trailing_position(position, key, symbol, mark)
 
-    def _check_trailing_position(self, position: dict[str, Any], symbol: str, mark: float) -> None:
+    def _check_trailing_position(self, position: dict[str, Any], key: str, symbol: str, mark: float) -> None:
         """对单条已确认归属的突破仓位执行 R 阶止损检查。"""
         actual_amount = self._exchange_positions.get(
             position_key(symbol, position.get("positionSide"))
@@ -768,7 +900,7 @@ class PositionMonitor:
             new_level += 1
         if new_level == level:
             return
-        atr = self._atr.get(symbol)
+        atr = self._atr.get(key)
         if atr is None:
             self.logger.warning("移动止损:ATR 缺失 symbol=%s,暂不移动", symbol)
             return
@@ -918,62 +1050,66 @@ class PositionMonitor:
 
     # ---- 盈亏自动全平 ----
 
-    def _current_pnl_pct(self) -> float | None:
-        """账户未实现盈亏占钱包余额的百分比(与 GUI 展示同一口径)。
-
-        仅统计程序开出的仓位(本地台账记录的交易对):手动开的大额仓位
-        不计入触发判断。盈亏直接取交易所官方 unrealizedProfit(positionRisk
-        快照每 5 分钟 + WS API 每 30 秒校准 + ACCOUNT_UPDATE 事件,均为官方
-        权威值),不手工用 (标记价−开仓价)×数量 计算——避免对冲模式多空
-        记录覆盖开仓价、快照数据异常导致浮盈虚高误触发。
-        """
-        # 超过一个全量快照周期仍未成功刷新时，禁止使用旧数据触发任何全平动作。
-        if time.monotonic() - self._last_successful_snapshot > FULL_SNAPSHOT_SECONDS:
-            self.logger.warning("账户快照已过期,跳过自动全平判断")
-            return None
-        usdt = self._account_balances.get("USDT", {})
-        wallet = float(usdt.get("balance", 0.0))
-        if wallet <= 0:
-            return None
-        ledger_keys = {
+    def _program_position_keys(self) -> set[str]:
+        return {
             position_key(position.get("symbol"), position.get("positionSide"))
             for position in load_positions(self.config.environment)
             if position.get("status", "active") == "active"
         }
-        unrealized = 0.0
-        for key, info in self._account_positions.items():
-            if key not in ledger_keys:
-                continue  # 非程序仓(手动开仓)不计入触发判断
-            unrealized += float(info.get("unrealizedProfit", 0.0))
+
+    def _current_pnl_pct(self) -> float | None:
+        """返回权威程序组合未实现盈亏 / 当前钱包余额百分比。"""
+        if time.monotonic() - self._last_successful_snapshot > FULL_SNAPSHOT_SECONDS:
+            return None
+        with self._state_lock:
+            wallet = float(self._account_balances.get("USDT", {}).get("balance", 0.0))
+            positions = {key: dict(value) for key, value in self._account_positions.items()}
+        if wallet <= 0:
+            return None
+        keys = self._program_position_keys()
+        unrealized = sum(float(info.get("unrealizedProfit", 0.0)) for key, info in positions.items() if key in keys)
         return unrealized / wallet * 100
 
-    def _check_auto_close(self) -> None:
-        """账户盈亏达到阈值时自动全平全部仓位(每秒检查,无冷却)。
+    def _estimated_pnl_pct(self) -> float | None:
+        """使用共享标记价格作每秒级预警；越线后必须再由 REST 权威确认。"""
+        with self._state_lock:
+            wallet = float(self._account_balances.get("USDT", {}).get("balance", 0.0))
+            positions = {key: dict(value) for key, value in self._account_positions.items()}
+            marks = dict(self._marks)
+        if wallet <= 0:
+            return None
+        total = Decimal("0")
+        for key in self._program_position_keys():
+            position = positions.get(key)
+            if position is None:
+                continue
+            mark = _decimal_of(marks.get(str(position.get("symbol") or "")))
+            amount = _decimal_of(position.get("positionAmt"))
+            entry = _decimal_of(position.get("entryPrice"))
+            if mark is None or amount is None or entry is None:
+                continue
+            total += amount * (mark - entry)
+        return float(total / Decimal(str(wallet)) * Decimal("100"))
 
-        全平后未实现盈亏归零自然回到阈值内;后续新仓再次达标可再触发。
-        """
+    def _threshold_reached(self, pct: float | None) -> bool:
+        return pct is not None and (pct >= self._auto_close_profit_pct or pct <= -self._auto_close_loss_pct)
+
+    def _check_auto_close(self) -> None:
+        """估算越线后用 REST 权威确认，再仅全平程序仓位。"""
         if self._auto_closing:
             return
-        pct = self._current_pnl_pct()
-        if pct is None:
+        if not self._threshold_reached(self._estimated_pnl_pct()):
             return
-        if pct >= self._auto_close_profit_pct or pct <= -self._auto_close_loss_pct:
-            # 触发明细:记录各程序仓的官方未实现盈亏,便于核对触发是否合理
-            ledger_keys = {
-                position_key(position.get("symbol"), position.get("positionSide"))
-                for position in load_positions(self.config.environment)
-                if position.get("status", "active") == "active"
-            }
-            detail = ", ".join(
-                f"{info.get('symbol')}/{info.get('positionSide')}:amt={info.get('positionAmt')} upnl={info.get('unrealizedProfit')}"
-                for key, info in sorted(self._account_positions.items())
-                if key in ledger_keys
-            )
-            self.logger.warning(
-                "盈亏自动全平触发 pnl=%+.2f%% 盈利阈值=%s%% 亏损阈值=%s%% 明细: %s",
-                pct, self._auto_close_profit_pct, self._auto_close_loss_pct, detail,
-            )
-            self._auto_close_all(pct)
+        # 标记价格仅作为预警；触发操作前强制刷新同轮权威仓位与钱包余额。
+        self._full_snapshot()
+        pct = self._current_pnl_pct()
+        if not self._threshold_reached(pct):
+            return
+        self.logger.warning(
+            "程序组合盈亏全平触发 pnl=%+.2f%% 盈利阈值=%s%% 亏损阈值=%s%%",
+            pct, self._auto_close_profit_pct, self._auto_close_loss_pct,
+        )
+        self._auto_close_all(pct)
 
     def _auto_close_all(self, pct: float) -> None:
         """市价全平**程序开出的仓位**(本地台账记录的交易对),手动仓不动。
@@ -1019,44 +1155,27 @@ class PositionMonitor:
         # 平仓后立即全量快照对齐:本地记录转幽灵清理,平仓盈亏自动落库
         self._full_snapshot()
 
-    # ---- listenKey 续期与 ATR ----
+    # ---- 流失效 REST 兜底与 listenKey 续期 ----
 
-    def _refresh_pnl_from_ws_api(self) -> None:
-        """周期通过 WebSocket API v2/account.status 刷新官方未实现盈亏。
+    def _mark_fallback_needed(self, now: float) -> bool:
+        if not self._trail_tasks or not self._mark_stream_connected:
+            return bool(self._trail_tasks)
+        return any(now - self._mark_received_at.get(key.split("|", 1)[0], 0.0) > MARK_STALE_SECONDS for key in self._trail_tasks)
 
-        价格变动不触发 ACCOUNT_UPDATE 事件,官方权威盈亏需主动查询;
-        查询结果更新账户快照(GUI 依据 updatedAt 自动刷新)。
-        """
-        self._last_pnl_refresh = time.monotonic()
-        if self._ws_api is None:
-            return
+    def _refresh_marks_from_rest(self) -> None:
+        """行情流中断/陈旧时以 10 秒 REST 批量标记价格兜底。"""
         try:
-            result = self._ws_api.account_status()
+            marks = self._client.get_mark_prices()
         except Exception as exc:
-            self.logger.warning("WS API 账户状态查询失败: %s", exc)
+            self.logger.warning("标记价格 REST 兜底失败: %s", exc)
             return
-        total = result.get("totalUnrealizedProfit")
-        if total is not None:
-            usdt = self._account_balances.setdefault("USDT", {})
-            usdt["unrealizedProfit"] = _safe_float(total)
-            wallet = _safe_float(result.get("totalWalletBalance"))
-            if wallet > 0:
-                # 修复钱包余额:ACCOUNT_UPDATE 的 B 数组 wb 在测试网实测为 0,以官方 totalWalletBalance 为准
-                usdt["balance"] = wallet
-            available = _safe_float(result.get("availableBalance"))
-            if available > 0:
-                usdt["availableBalance"] = available
-        positions = result.get("positions")
-        if isinstance(positions, list):
-            for item in positions:
-                if not isinstance(item, dict):
-                    continue
-                symbol = item.get("symbol")
-                if isinstance(symbol, str) and symbol in self._account_positions:
-                    self._account_positions[symbol]["unrealizedProfit"] = _safe_float(
-                        item.get("unrealizedProfit")
-                    )
-        self._snapshot_updated_at = time.monotonic()
+        now = time.monotonic()
+        with self._state_lock:
+            for symbol, mark in marks.items():
+                self._marks[symbol] = mark
+                self._mark_received_at[symbol] = now
+        for task in tuple(self._trail_tasks.values()):
+            task.wake()
 
     def _renew_listen_key(self) -> None:
         """每 30 分钟续期 listenKey(官方 60 分钟 TTL)。"""
@@ -1068,34 +1187,6 @@ class PositionMonitor:
             self.logger.info("listenKey 已续期")
         except Exception as exc:
             self.logger.warning("listenKey 续期失败: %s", exc)
-
-    def _refresh_atr(self) -> None:
-        """刷新受移动止损监管仓位的 1h ATR(14),基于最新已收盘 1h K 线。"""
-        self._last_atr = time.monotonic()
-        symbols = [
-            item["symbol"]
-            for item in load_positions(self.config.environment)
-            if item.get("signalType") in TRAILED_SIGNALS
-        ]
-        if not symbols:
-            return
-        klines, failures = fetch_klines_with_failures(
-            symbols, "1h", ATR_PERIOD + 1, self.config.use_testnet, self.config.http_timeout_seconds
-        )
-        for symbol, raw_klines in klines.items():
-            candles = parse_candles(raw_klines)
-            if len(candles) < ATR_PERIOD + 1:
-                continue
-            true_ranges = [
-                max(candle[2] - candle[3], abs(candle[2] - previous[4]), abs(candle[3] - previous[4]))
-                for candle, previous in zip(candles[1:], candles[:-1])
-            ]
-            atr = sum(true_ranges[-ATR_PERIOD:]) / ATR_PERIOD
-            self._atr[symbol] = Decimal(str(atr))
-            self.logger.info("ATR 已刷新 symbol=%s atr14_1h=%s", symbol, atr)
-        if failures:
-            self.logger.warning("ATR 刷新部分失败: %s", failures)
-
 
 def _env(name: str) -> str:
     """读取密钥:优先环境变量,缺失时回退旧程序配置文件。"""
@@ -1117,3 +1208,16 @@ def _safe_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return number if math.isfinite(number) else 0.0
+
+
+def _next_interval_close_monotonic(interval: str) -> float:
+    """返回下一根箱体周期 K 线收盘后的单调时钟时刻（额外等待 2 秒结算）。"""
+    seconds_by_interval = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+        "8h": 28800, "12h": 43200, "1d": 86400,
+    }
+    seconds = seconds_by_interval.get(interval, 3600)
+    now_wall = time.time()
+    next_close = (math.floor(now_wall / seconds) + 1) * seconds + 2
+    return time.monotonic() + max(1.0, next_close - now_wall)

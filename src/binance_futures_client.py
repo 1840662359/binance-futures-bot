@@ -31,7 +31,9 @@ SERVER_TIME_PATH = "/fapi/v1/time"
 LAST_PRICE_PATH = "/fapi/v2/ticker/price"
 # v2 将弃用,官方建议 v3(仅返回有持仓/挂单的 symbol)
 BALANCE_PATH = "/fapi/v3/balance"
+ACCOUNT_PATH = "/fapi/v3/account"
 POSITION_RISK_PATH = "/fapi/v3/positionRisk"
+MARK_PRICE_PATH = "/fapi/v1/premiumIndex"
 POSITION_SIDE_DUAL_PATH = "/fapi/v1/positionSide/dual"
 LEVERAGE_PATH = "/fapi/v1/leverage"
 LEVERAGE_BRACKET_PATH = "/fapi/v1/leverageBracket"
@@ -134,8 +136,8 @@ class BinanceFuturesClient:
     def get_wallet_balance_usdt(self) -> float:
         """查询 USDT 钱包余额(/fapi/v3/balance 的 balance 字段)。
 
-        钱包余额含已实现盈亏与未实现盈亏,是账户盈亏百分比
-        (账户持仓卡片/盈亏统计卡片)的分母基准。
+        钱包余额会反映已结算的资金变动，但不以保证金余额
+        (margin balance)作为风险百分比分母。
         """
         payload = self._signed_request("GET", BALANCE_PATH, {})
         if not isinstance(payload, list):
@@ -151,6 +153,36 @@ class BinanceFuturesClient:
                 raise RuntimeError("USDT 钱包余额无效。")
             return wallet
         return 0.0
+
+    def get_account_overview(self) -> dict[str, Any]:
+        """查询账户汇总(/fapi/v3/account)。
+
+        监控模块用其中的 totalWalletBalance 作为程序组合未实现盈亏
+        百分比的分母；禁止改用 totalMarginBalance，后者包含未实现盈亏。
+        官方文档：
+        https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/rest-api
+        """
+        payload = self._signed_request("GET", ACCOUNT_PATH, {})
+        if not isinstance(payload, dict):
+            raise RuntimeError("账户汇总响应格式无效。")
+        return payload
+
+    def get_mark_prices(self) -> dict[str, float]:
+        """查询全市场标记价格(/fapi/v1/premiumIndex)，供行情流失效时兜底。"""
+        payload = self._public_request(MARK_PRICE_PATH)
+        items = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+        marks: dict[str, float] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            try:
+                mark = float(item.get("markPrice"))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(symbol, str) and math.isfinite(mark) and mark > 0:
+                marks[symbol] = mark
+        return marks
 
     def get_position_risk(self) -> dict[str, float]:
         """查询全部持仓数量(/fapi/v3/positionRisk),返回 symbol → 持仓绝对量。

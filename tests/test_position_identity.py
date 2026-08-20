@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import json
 from pathlib import Path
@@ -64,7 +66,7 @@ class PositionIdentityTests(unittest.TestCase):
 
     def test_failed_snapshot_preserves_last_successful_state(self) -> None:
         class FailingClient:
-            def get_leverage_map(self):
+            def get_positions_detail(self):
                 raise RuntimeError("network unavailable")
 
         monitor = object.__new__(PositionMonitor)
@@ -83,12 +85,30 @@ class PositionIdentityTests(unittest.TestCase):
         self.assertEqual(monitor._exchange_positions, {position_key("BTCUSDT", "LONG"): 1.0})
         self.assertEqual(monitor._last_successful_snapshot, 123.0)
 
-    def test_private_and_market_streams_only_subscribe_required_data(self) -> None:
+    def test_private_and_market_streams_use_private_and_all_market_endpoints(self) -> None:
         user_stream = UserDataStream(False, "listen-key", None, lambda _: None)
         self.assertEqual(user_stream._build_url(), "wss://fstream.binance.com/private/ws/listen-key")
         mark_stream = MarkPriceStream(False, None, lambda _: None)
         mark_stream.set_symbols({"BTCUSDT", "ETHUSDT"})
-        self.assertEqual(mark_stream._symbols_snapshot(), ["btcusdt@markPrice@1s", "ethusdt@markPrice@1s"])
+        self.assertEqual(mark_stream._symbols_snapshot(), ["!markPrice@arr@1s"])
+        self.assertIn("!markPrice@arr@1s", mark_stream._build_url())
+
+    def test_authoritative_program_pnl_uses_wallet_balance_and_exact_position_keys(self) -> None:
+        monitor = object.__new__(PositionMonitor)
+        monitor.config = SimpleNamespace(environment="production")
+        monitor._state_lock = threading.RLock()
+        monitor._last_successful_snapshot = time.monotonic()
+        monitor._account_balances = {"USDT": {"balance": 1000.0}}
+        monitor._account_positions = {
+            position_key("BTCUSDT", "LONG"): {"unrealizedProfit": -120.0},
+            position_key("BTCUSDT", "SHORT"): {"unrealizedProfit": 40.0},
+            position_key("ETHUSDT", "BOTH"): {"unrealizedProfit": -900.0},
+        }
+        with patch("position_monitor.load_positions", return_value=[
+            {"symbol": "BTCUSDT", "positionSide": "LONG", "status": "active"},
+            {"symbol": "BTCUSDT", "positionSide": "SHORT", "status": "active"},
+        ]):
+            self.assertEqual(monitor._current_pnl_pct(), -8.0)
 
 
 if __name__ == "__main__":

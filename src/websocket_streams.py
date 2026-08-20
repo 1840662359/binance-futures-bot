@@ -52,10 +52,17 @@ class _ReconnectingStream(threading.Thread):
     create_connection(支持 http_proxy_host/port)自管理连接与 ping 保活。
     """
 
-    def __init__(self, name: str, proxy_url: str | None, on_message: Callable[[dict[str, Any]], None]) -> None:
+    def __init__(
+        self,
+        name: str,
+        proxy_url: str | None,
+        on_message: Callable[[dict[str, Any]], None],
+        on_connection_change: Callable[[bool], None] | None = None,
+    ) -> None:
         super().__init__(name=name, daemon=True)
         self._proxy_url = proxy_url
         self._on_message_callback = on_message
+        self._on_connection_change = on_connection_change
         self._stop = threading.Event()
         # 订阅变化唤醒事件:无订阅时线程安静等待,新持仓出现立即唤醒连接(不空转轮询)
         self._wake = threading.Event()
@@ -78,7 +85,7 @@ class _ReconnectingStream(threading.Thread):
                 symbols = self._symbols_snapshot()
                 if not symbols:
                     # 无订阅:不连接、不轮询,安静等待订阅变化唤醒或停止请求
-                    self._connected.clear()
+                    self._set_connected(False)
                     self._wake.wait(RECONNECT_BACKOFF_SECONDS)
                     self._wake.clear()
                     if self._stop.is_set():
@@ -97,12 +104,12 @@ class _ReconnectingStream(threading.Thread):
                     )
                 except Exception as exc:
                     self._logger.warning("WebSocket 连接失败 %s: %s", url, exc)
-                    self._connected.clear()
+                    self._set_connected(False)
                     if self._wait_or_wake(backoff):
                         return
                     backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF_SECONDS)
                     continue
-                self._connected.set()
+                self._set_connected(True)
                 self._logger.info("WebSocket 已连接 %s", self.name)
                 # 连接成功后重置退避,避免多次断线后重连延迟累积到上限
                 backoff = RECONNECT_BACKOFF_SECONDS
@@ -129,7 +136,7 @@ class _ReconnectingStream(threading.Thread):
                     except Exception:
                         pass
                     self._ws = None
-                    self._connected.clear()
+                    self._set_connected(False)
                     self._logger.warning("WebSocket 已断开 %s", self.name)
                 if self._wait_or_wake(backoff):
                     return
@@ -139,6 +146,20 @@ class _ReconnectingStream(threading.Thread):
                 self._logger.exception("WebSocket 重连循环异常 %s: %r", self.name, exc)
                 if self._wait_or_wake(RECONNECT_BACKOFF_SECONDS):
                     return
+
+    def _set_connected(self, connected: bool) -> None:
+        """更新连接状态，并将状态变化通知上层监控器。"""
+        was_connected = self._connected.is_set()
+        if connected:
+            self._connected.set()
+        else:
+            self._connected.clear()
+        if was_connected == connected or self._on_connection_change is None:
+            return
+        try:
+            self._on_connection_change(connected)
+        except Exception:
+            self._logger.exception("WebSocket 连接状态回调异常 %s", self.name)
 
     def _on_message(self, raw_message: str) -> None:
         if not raw_message or not raw_message.strip():
@@ -194,8 +215,9 @@ class UserDataStream(_ReconnectingStream):
     """Private 用户数据流:接收账户、订单及条件单状态事件。"""
 
     def __init__(self, use_testnet: bool, listen_key: str, proxy_url: str | None,
-                 on_message: Callable[[dict[str, Any]], None]) -> None:
-        super().__init__(f"user-data-{listen_key[:8]}", proxy_url, on_message)
+                 on_message: Callable[[dict[str, Any]], None],
+                 on_connection_change: Callable[[bool], None] | None = None) -> None:
+        super().__init__(f"user-data-{listen_key[:8]}", proxy_url, on_message, on_connection_change)
         self._use_testnet = use_testnet
         self._listen_key = listen_key
 
@@ -208,7 +230,7 @@ class UserDataStream(_ReconnectingStream):
 
 
 class MarkPriceStream(_ReconnectingStream):
-    """Market 标记价格流:仅订阅执行 R 阶移动止损的程序仓位。
+    """Market 全市场标记价格流，向监控器提供统一的价格缓存。
 
     官方文档(AGENTS.md 登记):
     - All Market Mark Price Stream: !markPrice@arr(约 3 秒全量推送一轮,期间
@@ -221,24 +243,18 @@ class MarkPriceStream(_ReconnectingStream):
     """
 
     def __init__(self, use_testnet: bool, proxy_url: str | None,
-                 on_message: Callable[[dict[str, Any]], None]) -> None:
-        super().__init__("mark-price", proxy_url, on_message)
+                 on_message: Callable[[dict[str, Any]], None],
+                 on_connection_change: Callable[[bool], None] | None = None) -> None:
+        super().__init__("mark-price", proxy_url, on_message, on_connection_change)
         self._use_testnet = use_testnet
-        self._subscription_lock = threading.Lock()
-        self._symbols: set[str] = set()
 
     def set_symbols(self, symbols: set[str]) -> None:
-        """更新程序突破仓位订阅；无仓位时不建立市场连接。"""
-        normalized = {symbol.lower() for symbol in symbols if symbol}
-        with self._subscription_lock:
-            changed = normalized != self._symbols
-            self._symbols = normalized
-        if changed:
-            self.request_rebuild()
+        """兼容旧调用；全市场流无需根据仓位改变订阅。"""
+        del symbols
 
     def _symbols_snapshot(self) -> list[str]:
-        with self._subscription_lock:
-            return [f"{symbol}@markPrice@1s" for symbol in sorted(self._symbols)]
+        # 即使当前没有程序仓位，也保持全市场流连接，供后续开仓立即使用。
+        return ["!markPrice@arr@1s"]
 
     def _build_url(self) -> str:
         streams = "/".join(self._symbols_snapshot())
