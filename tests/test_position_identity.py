@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SOURCE_DIRECTORY))
 
 from binance_futures_client import BinanceFuturesClient
 from position_monitor import PositionMonitor, add_position, load_positions, position_key, remove_position
+from trading_executor import TradingExecutor
 from websocket_streams import MarkPriceStream, UserDataStream
 
 
@@ -25,12 +27,32 @@ class PositionIdentityTests(unittest.TestCase):
             with patch("position_monitor.runtime_directory", return_value=runtime):
                 add_position("production", {"symbol": "BTCUSDT", "positionSide": "LONG", "quantity": 1})
                 add_position("production", {"symbol": "BTCUSDT", "positionSide": "SHORT", "quantity": 2})
+                self.assertTrue((runtime / "program_positions.json").is_file())
                 positions = load_positions("production")
                 self.assertEqual({item["positionKey"] for item in positions}, {
                     position_key("BTCUSDT", "LONG"), position_key("BTCUSDT", "SHORT"),
                 })
                 remove_position("production", "BTCUSDT", "LONG")
                 self.assertEqual(load_positions("production")[0]["positionSide"], "SHORT")
+
+    def test_program_positions_reads_legacy_file_until_first_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            legacy = runtime / "position_state.json"
+            legacy.write_text(json.dumps({"positions": [{"symbol": "ETHUSDT"}]}), encoding="utf-8")
+            with patch("position_monitor.runtime_directory", return_value=runtime):
+                self.assertEqual(load_positions("production"), [{"symbol": "ETHUSDT"}])
+
+    def test_entry_ledger_contains_only_initial_filled_facts(self) -> None:
+        entry = TradingExecutor._entry_ledger_record({
+            "fingerprint": "BTCUSDT|1", "symbol": "BTCUSDT", "status": "filled",
+            "entryPrice": 100.0, "quantity": 1.0, "estimatedEntry": 99.0,
+            "order": {"orderId": 7, "positionSide": "LONG", "stopOrderId": 9},
+        })
+        self.assertEqual(entry["entryPrice"], 100.0)
+        self.assertNotIn("estimatedEntry", entry)
+        self.assertEqual(entry["entryOrder"]["orderId"], 7)
+        self.assertEqual(entry["initialProtection"]["stopOrderId"], 9)
 
     def test_position_presence_does_not_net_hedge_sides(self) -> None:
         client = object.__new__(BinanceFuturesClient)

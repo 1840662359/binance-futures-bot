@@ -39,7 +39,9 @@ from secret_utils import get_secret
 from websocket_streams import MarkPriceStream, UserDataStream
 from ws_api_client import WsApiClient
 
-POSITION_STATE_FILENAME = "position_state.json"
+# 程序当前持仓的可变列表；与只追加的开仓台账分离。
+PROGRAM_POSITIONS_FILENAME = "program_positions.json"
+LEGACY_POSITION_STATE_FILENAME = "position_state.json"
 BREAKOUT_SIGNAL = "上破箱体上沿"
 BREAKDOWN_SIGNAL = "下破箱体下沿"
 # 受移动止损监管的信号(上破多/下破空,多空镜像)
@@ -76,7 +78,7 @@ def get_active_monitor() -> "PositionMonitor | None":
 
 
 def _ledger_path(environment: str) -> Path:
-    return runtime_directory(environment) / POSITION_STATE_FILENAME
+    return runtime_directory(environment) / PROGRAM_POSITIONS_FILENAME
 
 
 def position_key(symbol: Any, position_side: Any = "BOTH") -> str:
@@ -89,9 +91,13 @@ def position_key(symbol: Any, position_side: Any = "BOTH") -> str:
 
 
 def _read_positions_unlocked(path: Path) -> list[dict[str, Any]]:
-    """无锁读取本地持仓列表;文件不存在或损坏时返回空列表。"""
+    """无锁读取程序持仓列表；首次升级时兼容旧 position_state.json。"""
     if not path.is_file():
-        return []
+        legacy_path = path.with_name(LEGACY_POSITION_STATE_FILENAME)
+        if legacy_path.is_file():
+            path = legacy_path
+        else:
+            return []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

@@ -1,4 +1,4 @@
-"""按信号池自动市价开仓并挂 reduceOnly 止损,维护订单台账与执行状态。
+"""按信号池自动市价开仓并挂 reduceOnly 止损,维护开仓台账与执行状态。
 
 执行规则(与用户确认的决策一致):
 - 三种信号全部市价单开仓;仓位按风险制计算:单笔最大亏损 = 可用余额的 risk_per_trade_pct;
@@ -42,6 +42,7 @@ API_KEY_ENVIRONMENT_VARIABLE = "BINANCE_API_KEY"
 API_SECRET_ENVIRONMENT_VARIABLE = "BINANCE_API_SECRET"
 TESTNET_API_KEY_ENVIRONMENT_VARIABLE = "BINANCE_TESTNET_API_KEY"
 TESTNET_API_SECRET_ENVIRONMENT_VARIABLE = "BINANCE_TESTNET_API_SECRET"
+# 只追加实际成交后的开仓初始事实；跳过/失败明细仅写 trading_status.json。
 LEDGER_FILENAME = "order_ledger.json"
 STATUS_FILENAME = "trading_status.json"
 
@@ -209,7 +210,8 @@ class TradingExecutor:
                 self._register_position(record)
                 self._notify_open(record)
             records.append(record)
-            ledger.append(record)
+            if record.get("status") == "filled":
+                ledger.append(self._entry_ledger_record(record))
             summary[record.get("summaryKey", "failed")] = summary.get(record.get("summaryKey", "failed"), 0) + 1
 
         if any(signal.get("consumed") for signal in signals):
@@ -243,7 +245,7 @@ class TradingExecutor:
         return [signal for signal in signals if isinstance(signal, dict)], run_id, payload
 
     def _load_ledger(self) -> list[dict[str, Any]]:
-        """读取订单台账;文件不存在或损坏时按空台账处理。"""
+        """读取开仓台账；兼容旧版本后仅保留已成交的开仓记录。"""
         if not self.ledger_path.is_file():
             return []
         try:
@@ -252,7 +254,10 @@ class TradingExecutor:
             self.logger.warning("订单台账损坏,按空台账处理: %s", self.ledger_path)
             return []
         ledger = payload.get("ledger") if isinstance(payload, dict) else None
-        return [item for item in ledger if isinstance(item, dict)] if isinstance(ledger, list) else []
+        return [
+            item for item in ledger
+            if isinstance(item, dict) and item.get("status") == "filled"
+        ] if isinstance(ledger, list) else []
 
     def _load_contract_filters(self, symbol: str) -> dict[str, dict[str, Any]] | None:
         """从合约池读取交易对 filters,按 filterType 建立索引。"""
@@ -830,12 +835,42 @@ class TradingExecutor:
         write_json_atomically(payload, self.signal_pool_path)
 
     def _write_ledger(self, ledger: list[dict[str, Any]]) -> None:
-        """原子写入订单台账。"""
+        """原子写入只含开仓初始真实信息的台账。"""
         payload = {
             "source": {"environment": self.config.environment, "updatedAt": _now_iso()},
             "ledger": ledger,
         }
         write_json_atomically(payload, self.ledger_path)
+
+    @staticmethod
+    def _entry_ledger_record(record: dict[str, Any]) -> dict[str, Any]:
+        """提取成交后可审计的开仓初始事实，避免台账混入预估与运行过程状态。"""
+        order = record.get("order") if isinstance(record.get("order"), dict) else {}
+        return {
+            key: record.get(key)
+            for key in (
+                "fingerprint", "runId", "symbol", "signalType", "direction",
+                "signalKlineOpenTime", "entryPrice", "quantity", "stopPrice",
+                "stopBuffer", "leverage", "riskPercent", "createdAt",
+            )
+        } | {
+            "status": "filled",
+            "entryOrder": {
+                key: order.get(key)
+                for key in (
+                    "orderId", "clientOrderId", "side", "positionSide", "type",
+                    "status", "executedQty", "entryPriceFromPosition",
+                )
+            },
+            "initialProtection": {
+                key: order.get(key)
+                for key in (
+                    "stopOrderId", "stopOrderStatus", "stopClosePosition",
+                    "takeProfitOrderId", "takeProfitOrderStatus", "takeProfitNote",
+                )
+            },
+            "takeProfitPrice": record.get("takeProfitPrice"),
+        }
 
     def _write_status(
         self,
