@@ -1,0 +1,2 @@
+PySide6>=6.8,<7
+websocket-client>=1.8,<2
