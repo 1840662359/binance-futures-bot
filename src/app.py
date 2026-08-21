@@ -1663,7 +1663,7 @@ class MainWindow(QMainWindow):
         columns = [
             ("交易对", "symbol"), ("方向", "direction"), ("数量", "quantity"),
             ("开仓价", "entryPrice"), ("平仓价", "exit"), ("净盈亏", "net"),
-            ("手续费", "commission"), ("平仓原因", "closeReason"), ("平仓时间", "closeTime"),
+            ("手续费", "commission"), ("平仓时间", "closeTime"),
         ]
         self.pnl_table.setColumnCount(len(columns))
         self.pnl_table.setHorizontalHeaderLabels([label for label, _ in columns])
@@ -1688,7 +1688,6 @@ class MainWindow(QMainWindow):
                 "exit": f"{exit_price:.8g}" if exit_price is not None else "—",
                 "net": f"{net:+,.2f}",
                 "commission": f"{commission:+,.2f}",
-                "closeReason": str(record.get("closeReason") or "—"),
                 "closeTime": close_time_text,
             }
             for column, (_, field) in enumerate(columns):

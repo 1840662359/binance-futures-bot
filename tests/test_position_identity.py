@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import json
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -172,12 +173,104 @@ class PositionIdentityTests(unittest.TestCase):
         self.assertEqual(assets, {"USDT": -2.0})
         self.assertEqual(exits, [2])
 
+    def test_positive_exchange_commission_is_normalized_to_negative_expense(self) -> None:
+        class Client:
+            def get_user_trades(self, *_, **__):
+                return [
+                    {"positionSide": "LONG", "side": "BUY", "realizedPnl": "0", "commission": "0.01", "commissionAsset": "USDT", "orderId": 1},
+                    {"positionSide": "LONG", "side": "SELL", "realizedPnl": "1", "commission": "0.02", "commissionAsset": "USDT", "orderId": 2},
+                ]
+
+            def get_income(self, *_, **__):
+                return []
+
+        monitor = object.__new__(PositionMonitor)
+        monitor._client = Client()
+        realized, commission, funding, assets, _ = monitor._query_lifecycle_pnl("BTCUSDT", 1, 2, "多", "LONG")
+        self.assertEqual((realized, commission, funding), (1.0, -0.03, 0.0))
+        self.assertEqual(assets, {"USDT": -0.03})
+
+    def test_pnl_includes_entry_fee_that_precedes_open_position_timestamp(self) -> None:
+        class Client:
+            def get_user_trades(self, *_, **__):
+                return [
+                    {"id": 1, "time": 950, "positionSide": "LONG", "side": "BUY", "realizedPnl": "0", "commission": "0.01", "commissionAsset": "USDT", "orderId": 101},
+                    {"id": 2, "time": 960, "positionSide": "LONG", "side": "BUY", "realizedPnl": "0", "commission": "0.9", "commissionAsset": "USDT", "orderId": 999},
+                    {"id": 3, "time": 1200, "positionSide": "LONG", "side": "SELL", "realizedPnl": "1", "commission": "0.02", "commissionAsset": "USDT", "orderId": 202},
+                ]
+
+            def get_income(self, *_, **__):
+                return []
+
+        monitor = object.__new__(PositionMonitor)
+        monitor._client = Client()
+        realized, commission, _, assets, exits = monitor._query_lifecycle_pnl(
+            "BTCUSDT", 1000, 2000, "多", "LONG", entry_order_id=101,
+        )
+        self.assertEqual((realized, commission), (1.0, -0.03))
+        self.assertEqual(assets, {"USDT": -0.03})
+        self.assertEqual(exits, [202])
+
+    def test_unmatched_close_event_is_rechecked_against_registered_stop(self) -> None:
+        class Client:
+            def get_algo_order_status(self, *_):
+                return {"algoStatus": "TRIGGERED"}
+
+        monitor = object.__new__(PositionMonitor)
+        monitor._client = Client()
+        monitor.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+        reason = monitor._resolve_close_reason(
+            {"symbol": "BTCUSDT", "stopAlgoId": 123},
+            {"closeReason": "平仓原因待核实"},
+            tp_missing=False,
+            stop_missing=True,
+        )
+        self.assertEqual(reason, "程序止损")
+
     def test_market_order_accepts_program_client_order_id(self) -> None:
         client = object.__new__(BinanceFuturesClient)
         captured = {}
         client._signed_request = lambda _method, _path, params: captured.update(params) or {}
         client.place_market_order("BTCUSDT", "SELL", "1", reduce_only=True, client_order_id="bot-autoclose-1")
         self.assertEqual(captured["newClientOrderId"], "bot-autoclose-1")
+
+    def test_initial_stops_follow_box_boundary_and_range_one_to_one(self) -> None:
+        executor = object.__new__(TradingExecutor)
+        box = {"upper": 110, "lower": 90}
+        breakout_long = executor._stop_for_signal(
+            {"signalType": "上破箱体上沿", "direction": "多"}, box, Decimal("2"), Decimal("115")
+        )
+        breakout_short = executor._stop_for_signal(
+            {"signalType": "下破箱体下沿", "direction": "空"}, box, Decimal("2"), Decimal("85")
+        )
+        range_long = executor._stop_for_signal(
+            {"signalType": "箱体内低吸", "direction": "多"}, box, Decimal("0"), Decimal("96"), Decimal("100")
+        )
+        range_short = executor._stop_for_signal(
+            {"signalType": "箱体内高抛", "direction": "空"}, box, Decimal("0"), Decimal("104"), Decimal("100")
+        )
+        self.assertEqual(breakout_long[0], Decimal("88"))
+        self.assertEqual(breakout_short[0], Decimal("112"))
+        self.assertEqual(range_long[0], Decimal("92"))
+        self.assertEqual(range_short[0], Decimal("108"))
+
+    def test_stop_rounding_keeps_stop_on_protective_side_of_tick(self) -> None:
+        executor = object.__new__(TradingExecutor)
+        filters = {"PRICE_FILTER": {"tickSize": "0.1", "minPrice": "0.1", "maxPrice": "1000"}}
+        self.assertEqual(executor._round_stop_price(Decimal("99.99"), filters, "BUY"), Decimal("99.9"))
+        self.assertEqual(executor._round_stop_price(Decimal("100.01"), filters, "SELL"), Decimal("100.1"))
+
+    def test_risk_loss_includes_stop_slippage_and_two_sided_fees(self) -> None:
+        # 多仓预估入场 100、止损 90：止损成交按 89.955，手续费按 100+89.955 的双边万五。
+        loss = TradingExecutor._estimated_total_loss(Decimal("100"), Decimal("90"), "BUY", Decimal("2"))
+        self.assertEqual(loss, Decimal("20.2799550"))
+
+    def test_limit_order_accepts_program_client_order_id(self) -> None:
+        client = object.__new__(BinanceFuturesClient)
+        captured = {}
+        client._signed_request = lambda _method, _path, params: captured.update(params) or {}
+        client.place_limit_order("BTCUSDT", "SELL", "100", "1", client_order_id="bot-take-profit-1")
+        self.assertEqual(captured["newClientOrderId"], "bot-take-profit-1")
 
 
 if __name__ == "__main__":

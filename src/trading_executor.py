@@ -2,7 +2,7 @@
 
 执行规则(与用户确认的决策一致):
 - 三种信号全部市价单开仓;仓位按风险制计算:单笔最大亏损 = 可用余额的 risk_per_trade_pct;
-- 止损 = 参考价 + buffer(1σ×收盘价):低吸多→箱体窗口内最低价(含影线 extremeLow)外侧,高抛空→箱体窗口内最高价(含影线 extremeHigh)外侧,上破多→箱体中轴下方、下破空→箱体中轴上方(信号 box 无 mid,按 (upper+lower)/2 计算);
+- 突破止损 = 箱体另一侧 + 既有缓冲:上破多→下沿下方、下破空→上沿上方;高抛低吸止损按真实成交价到中轨止盈价的 1:1 距离设置;
 - 止损单为 STOP_MARKET + reduceOnly,按标记价格触发;
 - 同一信号(交易对 + 信号 K 线起点)仅执行一次,台账去重;已有持仓的交易对不再开仓;
 - 模拟验证统一走 Binance 测试网(环境切换),本模块不提供本地模拟。
@@ -20,11 +20,11 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
-from binance_futures_client import BinanceFuturesClient
+from binance_futures_client import BinanceFuturesClient, BinanceFuturesError
 from logging_utils import configure_logging, get_logger
 from secret_utils import get_secret
 from scheduler import (
@@ -55,6 +55,10 @@ BUY_IN_BOX_SIGNAL = "箱体内低吸"
 TRADE_FEE_RATE = Decimal("0.001")
 TRADE_SLIPPAGE_RATE = Decimal("0.0005")
 TRADE_COST_RATE = TRADE_FEE_RATE + TRADE_SLIPPAGE_RATE
+# 交易请求最多三次：首次 + 两次有限退避重试。市价单和止损单在重试前均先权威回查，
+# 避免网络超时而交易所已受理时重复提交。
+ORDER_SUBMIT_ATTEMPTS = 3
+ORDER_RETRY_DELAYS_SECONDS = (1, 2)
 # 交易限制类跳过原因:命中即「放弃开仓」并消费信号
 # (低于最小数量/最小名义等规则限制;数量超过最大下单量已改为截断到上限下单,不再跳过)
 TRADE_LIMIT_REASONS = {
@@ -311,11 +315,9 @@ class TradingExecutor:
             return self._skipped_record(base, "仅做空模式,跳过多头信号")
 
         box = signal.get("box") if isinstance(signal.get("box"), dict) else {}
-        # 高抛低吸的止损缓冲:放在突破信号确认突破的位置之外,防止插针扫损
+        # 突破仓位沿用信号生成时的缓冲；高抛低吸止损按止盈距离 1:1 计算，
+        # 因而不使用箱体极值作为止损基准。
         stop_buffer = self._stop_buffer_for_signal(signal)
-        stop_price, side, stop_side, reason = self._stop_for_signal(base, box, stop_buffer)
-        if stop_price is None:
-            return self._skipped_record(base, reason)
         if self._is_executed(ledger, symbol, open_time):
             return self._skipped_record(base, "台账已执行")
         if abs(self.positions.get(symbol, 0.0)) > 0:
@@ -327,29 +329,17 @@ class TradingExecutor:
         filters = self._load_contract_filters(symbol)
         if filters is None:
             return self._skipped_record(base, "合约池缺少交易对规则")
-        stop_price = self._round_stop_price(stop_price, filters)
-        if stop_price is None:
-            return self._skipped_record(base, "止损价超出价格区间")
-
-        est_entry = self._estimate_entry(signal, symbol)
-        if est_entry is None:
+        reference_entry = self._estimate_entry(signal, symbol)
+        if reference_entry is None:
             return self._failed_record(base, "获取预估入场价失败", run_id)
-        if (side == "BUY" and est_entry <= stop_price) or (side == "SELL" and est_entry >= stop_price):
-            return self._skipped_record(base, "预估入场价已越过止损价")
 
-        # 风险制确定名义价值(与杠杆无关),按名义匹配杠杆档位取可用最大杠杆
-        quantity, notional, max_loss, effective_leverage, reason = self._compute_quantity(
-            symbol, stop_price, est_entry, filters
-        )
-        if quantity is None:
-            record = self._skipped_record(base, reason)
-            if reason in TRADE_LIMIT_REASONS:
-                # 交易对规则限制(数量/名义超出限制):消费信号但放弃开仓,记录具体原因
-                record["consumeSignal"] = True
-                record["consumedReason"] = reason
-            return record
+        side = "BUY" if base.get("direction") == "多" else "SELL" if base.get("direction") == "空" else ""
+        if not side:
+            return self._skipped_record(base, "信号方向无效")
+        # 风控反算使用预估的最不利成交价：开多向上、开空向下各计 0.05% 滑点。
+        est_entry = self._estimated_fill_price(reference_entry, side)
 
-        # 箱体内高抛低吸仓位:止盈价 = 箱体中轨(限价单);向上突破仓位不挂止盈
+        # 箱体内高抛低吸仓位:止盈价 = 箱体中轨(限价单);突破仓位不挂止盈。
         take_profit_price: Decimal | None = None
         if base.get("signalType") in (BUY_IN_BOX_SIGNAL, SELL_IN_BOX_SIGNAL):
             upper = _decimal(box.get("upper"))
@@ -357,7 +347,7 @@ class TradingExecutor:
             mid = (upper + lower) / 2 if upper is not None and lower is not None else None
             if mid is not None:
                 # 复用 tickSize 对齐逻辑,越界时返回 None 表示不挂止盈
-                take_profit_price = self._round_stop_price(mid, filters)
+                take_profit_price = self._round_stop_price(mid, filters, side)
             # 预估盈利检查:毛利润(止盈距离)须覆盖交易成本(开平手续费 + 成交滑点),
             # 否则消费信号但不下单(箱体过窄时止盈到中轨无法覆盖 0.15% 成本)
             profit_distance = abs(take_profit_price - est_entry) if take_profit_price is not None else None
@@ -368,11 +358,34 @@ class TradingExecutor:
                 record["consumeSignal"] = True
                 return record
 
+        stop_price, side, stop_side, reason = self._stop_for_signal(
+            base, box, stop_buffer, est_entry, take_profit_price,
+        )
+        if stop_price is None:
+            return self._skipped_record(base, reason)
+        stop_price = self._round_stop_price(stop_price, filters, side)
+        if stop_price is None:
+            return self._skipped_record(base, "止损价超出价格区间")
+        if (side == "BUY" and est_entry <= stop_price) or (side == "SELL" and est_entry >= stop_price):
+            return self._skipped_record(base, "预估入场价已越过止损价")
+
+        # 风险制确定名义价值(与杠杆无关),按名义匹配杠杆档位取可用最大杠杆
+        quantity, notional, max_loss, effective_leverage, reason = self._compute_quantity(
+            symbol, stop_price, est_entry, side, filters
+        )
+        if quantity is None:
+            record = self._skipped_record(base, reason)
+            if reason in TRADE_LIMIT_REASONS:
+                # 交易对规则限制(数量/名义超出限制):消费信号但放弃开仓,记录具体原因
+                record["consumeSignal"] = True
+                record["consumedReason"] = reason
+            return record
+
         computed = self._computed_fields(
             base, box, stop_price, est_entry, quantity, notional, max_loss, effective_leverage, stop_buffer
         )
         return self._place_orders(
-            computed, side, stop_side, quantity, stop_price, effective_leverage, take_profit_price
+            computed, side, stop_side, quantity, stop_price, effective_leverage, take_profit_price, filters
         )
 
     def _notify_open(self, record: dict[str, Any]) -> None:
@@ -461,33 +474,34 @@ class TradingExecutor:
         return self.config.leverage
 
     def _stop_for_signal(
-        self, base: dict[str, Any], box: dict[str, Any], stop_buffer: Decimal
+        self,
+        base: dict[str, Any],
+        box: dict[str, Any],
+        stop_buffer: Decimal,
+        entry_price: Decimal | None = None,
+        take_profit_price: Decimal | None = None,
     ) -> tuple[Decimal | None, str, str, str]:
         """按信号类型与方向返回 (止损价, 开仓方向, 止损单方向, 跳过原因)。
 
-        高抛低吸的止损参考价 = 箱体窗口内含影线的最高/最低价(extremeHigh/extremeLow,
-        而非按开收盘计算的 upper/lower),放在其外侧 stop_buffer 处,插针到边界附近
-        不会扫损;突破多单止损在箱体中轴下方 stop_buffer 处,同样保留 1σ×收盘价
-        的缓冲,避免价格回踩中轴附近即被扫损。
+        突破单止损位于箱体另一侧，且继续向外保留既有止损缓冲；高抛低吸单
+        以实际（开仓前为预估）成交价至中轨止盈价的距离为风险距离，即 1:1。
         """
         upper = _decimal(box.get("upper"))
         lower = _decimal(box.get("lower"))
-        mid = (upper + lower) / 2 if upper is not None and lower is not None else None
         signal_type = str(base.get("signalType", ""))
         direction = str(base.get("direction", ""))
         if signal_type == BUY_IN_BOX_SIGNAL and direction == "多":
-            # 旧信号缺 extremeLow 时回退箱体下沿
-            reference = _decimal(box.get("extremeLow")) or lower
-            return (reference - stop_buffer, "BUY", "SELL", "") if reference is not None else (None, "", "", "箱体参数无效")
+            if entry_price is None or take_profit_price is None or take_profit_price <= entry_price:
+                return None, "", "", "止盈价未在预估入场价上方"
+            return entry_price - (take_profit_price - entry_price), "BUY", "SELL", ""
         if signal_type == SELL_IN_BOX_SIGNAL and direction == "空":
-            # 旧信号缺 extremeHigh 时回退箱体上沿
-            reference = _decimal(box.get("extremeHigh")) or upper
-            return (reference + stop_buffer, "SELL", "BUY", "") if reference is not None else (None, "", "", "箱体参数无效")
+            if entry_price is None or take_profit_price is None or take_profit_price >= entry_price:
+                return None, "", "", "止盈价未在预估入场价下方"
+            return entry_price + (entry_price - take_profit_price), "SELL", "BUY", ""
         if signal_type == BREAKOUT_SIGNAL and direction == "多":
-            return (mid - stop_buffer, "BUY", "SELL", "") if mid is not None else (None, "", "", "箱体参数无效")
+            return (lower - stop_buffer, "BUY", "SELL", "") if lower is not None else (None, "", "", "箱体参数无效")
         if signal_type == BREAKDOWN_SIGNAL and direction == "空":
-            # 下破空单止损在箱体中轴上方 stop_buffer 处(与上破多单镜像)
-            return (mid + stop_buffer, "SELL", "BUY", "") if mid is not None else (None, "", "", "箱体参数无效")
+            return (upper + stop_buffer, "SELL", "BUY", "") if upper is not None else (None, "", "", "箱体参数无效")
         return (None, "", "", "信号类型与方向不匹配")
 
     def _stop_buffer_for_signal(self, signal: dict[str, Any]) -> Decimal:
@@ -517,11 +531,14 @@ class TradingExecutor:
             buffer = max(buffer, atr14)
         return buffer
 
-    def _round_stop_price(self, stop: Decimal, filters: dict[str, dict[str, Any]]) -> Decimal | None:
+    def _round_stop_price(
+        self, stop: Decimal, filters: dict[str, dict[str, Any]], side: str = "BUY"
+    ) -> Decimal | None:
         """将止损价对齐到 PRICE_FILTER tickSize 并校验价格区间。
 
         官方文档:stopPrice 必须是 tickSize 的整数倍且落在 minPrice~maxPrice 之间;
-        向下取整保证止损价永远合法,不改变信号本身的风险边界方向。
+        多仓止损向下取整、空仓止损向上取整，确保对突破单不削弱箱体外侧缓冲，
+        对 1:1 止损也不会因 tickSize 向有利方向偏移。
         """
         rule = filters.get("PRICE_FILTER")
         if not isinstance(rule, dict):
@@ -531,10 +548,31 @@ class TradingExecutor:
             return stop
         min_price = _decimal(rule.get("minPrice")) or Decimal("0")
         max_price = _decimal(rule.get("maxPrice"))
-        rounded = (stop / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
+        rounded = (stop / tick).to_integral_value(rounding=rounding) * tick
         if rounded < min_price or (max_price is not None and rounded > max_price):
             return None
         return rounded
+
+    @staticmethod
+    def _estimated_fill_price(reference_price: Decimal, side: str) -> Decimal:
+        """按开仓方向计入 0.05% 最不利滑点后的预估成交价。"""
+        multiplier = Decimal("1") + TRADE_SLIPPAGE_RATE if side == "BUY" else Decimal("1") - TRADE_SLIPPAGE_RATE
+        return reference_price * multiplier
+
+    @staticmethod
+    def _estimated_total_loss(entry: Decimal, stop: Decimal, side: str, quantity: Decimal) -> Decimal:
+        """计算触发止损时的预估总亏损，包含止损成交滑点及开平双边手续费。"""
+        if quantity <= 0:
+            return Decimal("0")
+        exit_multiplier = Decimal("1") - TRADE_SLIPPAGE_RATE if side == "BUY" else Decimal("1") + TRADE_SLIPPAGE_RATE
+        expected_exit = stop * exit_multiplier
+        price_loss = (entry - expected_exit) if side == "BUY" else (expected_exit - entry)
+        if price_loss <= 0:
+            return Decimal("0")
+        # 单边手续费为万分之五，开仓与平仓按各自预估成交额计入。
+        fees = (entry + expected_exit) * (TRADE_FEE_RATE / Decimal("2"))
+        return (price_loss + fees) * quantity
 
     def _estimate_entry(self, signal: dict[str, Any], symbol: str) -> Decimal | None:
         """预估入场价:优先最新价,失败回退信号 K 线收盘价。"""
@@ -552,6 +590,7 @@ class TradingExecutor:
         symbol: str,
         stop: Decimal,
         entry: Decimal,
+        side: str,
         filters: dict[str, dict[str, Any]],
     ) -> tuple[Decimal | None, Decimal | None, Decimal | None, int, str | None]:
         """按风险制确定名义价值并匹配杠杆档位计算开仓数量。
@@ -559,8 +598,9 @@ class TradingExecutor:
         返回 (数量, 名义金额, 最大亏损额, 有效杠杆, 跳过原因)。
 
         流程(与用户确认的逻辑):
-        1. 名义价值 = 单笔最大亏损 / 止损距离比例 = (余额×1%) / |开仓价−止损价| × 开仓价
-           ——纯风险制,与杠杆无关;
+        1. 单位风险 = 预估开仓成交价至预估止损成交价的价差 + 开平双边手续费；
+           预估开仓与止损成交均各纳入 0.05% 最不利滑点。
+           数量 = 单仓止损亏损上限 / 单位风险，杠杆不扩大风险预算;
         2. 按名义价值匹配 leverageBracket 档位(notionalFloor ≤ 名义 < notionalCap),
            使用该档位的可用最大杠杆(杠杆不扩大名义,仅影响保证金占用);
         3. 按 MARKET_LOT_SIZE stepSize 向下取整(官方:市价单按 MARKET_LOT_SIZE 校验),
@@ -585,12 +625,12 @@ class TradingExecutor:
         )
         min_notional = self._filter_number(filters, "MIN_NOTIONAL", "notional") or Decimal("0")
         max_loss = self.balance * Decimal(str(self.config.risk_per_trade_pct))
-        distance = abs(entry - stop)
-        if distance <= 0:
+        unit_loss = self._estimated_total_loss(entry, stop, side, Decimal("1"))
+        if unit_loss <= 0:
             return None, None, None, self.config.leverage, "开仓价与止损价重合"
-        notional_raw = max_loss / distance * entry
+        notional_raw = max_loss / unit_loss * entry
         leverage = self._leverage_for_notional(symbol, notional_raw)
-        quantity = (max_loss / distance / step).to_integral_value(rounding=ROUND_FLOOR) * step
+        quantity = (max_loss / unit_loss / step).to_integral_value(rounding=ROUND_FLOOR) * step
         notional = quantity * entry
         # 最大下单量约束:风险制数量超 maxQty 时截断到上限(向下取整到 step),而非放弃开仓
         if max_qty is not None and quantity > max_qty:
@@ -615,7 +655,7 @@ class TradingExecutor:
             if min_notional > 0 and notional < min_notional:
                 return None, None, None, leverage, "杠杆截断后名义金额低于最小下单限额"
             self.logger.warning("名义金额超保证金上限,数量已截断 symbol=%s qty=%s notional=%s", symbol, quantity, notional)
-        return quantity, notional, max_loss, leverage, None
+        return quantity, notional, self._estimated_total_loss(entry, stop, side, quantity), leverage, None
 
     def _place_orders(
         self,
@@ -626,6 +666,7 @@ class TradingExecutor:
         stop_price: Decimal,
         leverage: int,
         take_profit_price: Decimal | None,
+        filters: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         """真实执行:设置杠杆 → 市价开仓 → 查询真实持仓 → 成交守卫 → 挂全平止损单 → 挂中轨限价止盈。"""
         symbol = computed["symbol"]
@@ -644,7 +685,7 @@ class TradingExecutor:
         quantity_text = format(quantity, "f")
 
         try:
-            client.set_leverage(symbol, leverage)
+            self._retry_submission("设置杠杆", lambda: client.set_leverage(symbol, leverage))
         except Exception as exc:
             return self._failed_record(computed, f"设置杠杆失败:{exc}", computed.get("runId"))
         # 先落盘开仓意图，再向交易所发单。网络超时/进程退出时，监控器仍可依据
@@ -652,17 +693,13 @@ class TradingExecutor:
         client_order_id = f"bot-entry-{uuid.uuid4().hex[:22]}"
         self._register_opening_position(computed, position_side, client_order_id, stop_price)
         try:
-            order = client.place_market_order(
-                symbol, side, quantity_text, position_side, client_order_id=client_order_id,
+            order = self._submit_market_order(
+                client, symbol, side, quantity_text, position_side, reduce_only, client_order_id,
             )
         except Exception as exc:
-            # POST 超时不等于撮合失败；以客户端订单号回查一次，避免重复发单或遗失实际成交。
-            try:
-                order = client.get_order_status(symbol, client_order_id=client_order_id)
-            except Exception:
-                return self._failed_record(
-                    computed, f"市价单结果未知(已保留恢复意图):{exc}", computed.get("runId")
-                )
+            return self._failed_record(
+                computed, f"市价单结果未知(已保留恢复意图):{exc}", computed.get("runId")
+            )
         if order.get("status") != "FILLED":
             return self._failed_record(computed, f"市价单未成交,状态 {order.get('status')}", computed.get("runId"))
 
@@ -688,15 +725,32 @@ class TradingExecutor:
         computed["entryPrice"] = float(entry_price)
         computed["quantity"] = float(executed_qty)  # 以真实持仓量覆盖预估数量
 
+        if computed.get("signalType") in (BUY_IN_BOX_SIGNAL, SELL_IN_BOX_SIGNAL):
+            # 市价成交可能偏离预估价；以真实入场价重算止损，保证实际盈亏距离 1:1。
+            actual_stop, _, _, reason = self._stop_for_signal(
+                computed,
+                computed.get("box") if isinstance(computed.get("box"), dict) else {},
+                _decimal(computed.get("stopBuffer")) or Decimal("0"),
+                entry_price,
+                take_profit_price,
+            )
+            stop_price = self._round_stop_price(actual_stop, filters, side) if actual_stop is not None else None
+            if stop_price is None:
+                note = self._close_position(client, symbol, side, executed_qty, position_side, reduce_only)
+                return self._failed_record(computed, f"真实成交后无法确定 1:1 止损({reason}),{note}", computed.get("runId"))
+            computed["stopPrice"] = float(stop_price)
+
         if (side == "BUY" and entry_price <= stop_price) or (side == "SELL" and entry_price >= stop_price):
             # 成交价越过止损价:立即反向平仓,保护资金
             note = self._close_position(client, symbol, side, executed_qty, position_side, reduce_only)
             return self._failed_record(computed, f"成交价越过止损价,{note}", computed.get("runId"))
+        # 以真实开仓价、止损触发后的 0.05% 预估滑点及双边手续费刷新实际风险预算。
+        computed["maxLossUsdt"] = float(self._estimated_total_loss(entry_price, stop_price, side, executed_qty))
 
         try:
-            # 全平止损单:closePosition=true,不传 quantity/reduceOnly,双向/对冲统一适用
-            stop_order = client.place_stop_market_close_position(
-                symbol, stop_side, format(stop_price, "f"), position_side
+            # 全平止损单:closePosition=true,不传 quantity/reduceOnly,双向/对冲统一适用。
+            stop_order = self._submit_stop_order(
+                client, symbol, stop_side, stop_price, position_side,
             )
         except Exception as exc:
             # 止损挂单失败:仓位已开且无保护,立即反向平仓
@@ -728,13 +782,9 @@ class TradingExecutor:
                 side == "SELL" and entry_price > take_profit_price
             ):
                 try:
-                    take_profit_order = client.place_limit_order(
-                        symbol,
-                        take_profit_side,
-                        format(take_profit_price, "f"),
-                        format(executed_qty, "f"),
-                        position_side,
-                        reduce_only,
+                    take_profit_order = self._submit_limit_order(
+                        client, symbol, take_profit_side, take_profit_price,
+                        executed_qty, position_side, reduce_only,
                     )
                     computed["takeProfitPrice"] = float(take_profit_price)
                     computed["order"]["takeProfitOrderId"] = take_profit_order.get("orderId")
@@ -790,6 +840,146 @@ class TradingExecutor:
                 time.sleep(1)
         return None
 
+    def _retry_submission(self, label: str, action: Any) -> Any:
+        """对可恢复网络/限流错误进行有限重试，业务拒单立即向上返回。"""
+        last_error: Exception | None = None
+        for attempt in range(ORDER_SUBMIT_ATTEMPTS):
+            try:
+                return action()
+            except Exception as exc:
+                last_error = exc
+                if not self._is_retryable_submission_error(exc) or attempt == ORDER_SUBMIT_ATTEMPTS - 1:
+                    raise
+                delay = ORDER_RETRY_DELAYS_SECONDS[attempt]
+                self.logger.warning("%s失败，第%s/%s次后重试: %s", label, attempt + 1, ORDER_SUBMIT_ATTEMPTS, exc)
+                time.sleep(delay)
+        raise RuntimeError(f"{label}失败:{last_error}")
+
+    @staticmethod
+    def _is_retryable_submission_error(exc: Exception) -> bool:
+        """仅将网络、超时及交易所临时繁忙类错误视为可重试。"""
+        if isinstance(exc, BinanceFuturesError):
+            return exc.code in {-1001, -1003, -1006, -1007, -1008, -1021}
+        return isinstance(exc, (OSError, TimeoutError, RuntimeError))
+
+    def _submit_market_order(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+        side: str,
+        quantity: str,
+        position_side: str | None,
+        reduce_only: bool,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        """以固定 clientOrderId 提交市价单；异常时先回查再重试，保证幂等。"""
+        last_error: Exception | None = None
+        for attempt in range(ORDER_SUBMIT_ATTEMPTS):
+            try:
+                return client.place_market_order(
+                    symbol, side, quantity, position_side, reduce_only, client_order_id,
+                )
+            except Exception as exc:
+                last_error = exc
+                try:
+                    existing = client.get_order_status(symbol, client_order_id=client_order_id)
+                    if existing:
+                        self.logger.warning("市价单请求异常但已由交易所确认 symbol=%s clientOrderId=%s", symbol, client_order_id)
+                        return existing
+                except Exception:
+                    pass
+                if not self._is_retryable_submission_error(exc) or attempt == ORDER_SUBMIT_ATTEMPTS - 1:
+                    raise
+                delay = ORDER_RETRY_DELAYS_SECONDS[attempt]
+                self.logger.warning("市价单提交失败，第%s/%s次后回查重试 symbol=%s: %s", attempt + 1, ORDER_SUBMIT_ATTEMPTS, symbol, exc)
+                time.sleep(delay)
+        raise RuntimeError(f"市价单提交失败:{last_error}")
+
+    def _submit_stop_order(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+        stop_side: str,
+        stop_price: Decimal,
+        position_side: str | None,
+    ) -> dict[str, Any]:
+        """提交止损单；网络异常时先查询未触发条件单，确认未受理才有限重试。"""
+        last_error: Exception | None = None
+        for attempt in range(ORDER_SUBMIT_ATTEMPTS):
+            try:
+                return client.place_stop_market_close_position(
+                    symbol, stop_side, format(stop_price, "f"), position_side,
+                )
+            except Exception as exc:
+                last_error = exc
+                existing = self._find_open_stop_order(client, symbol, stop_side, stop_price, position_side)
+                if existing is not None:
+                    self.logger.warning("止损请求异常但已由交易所确认 symbol=%s stop=%s", symbol, stop_price)
+                    return existing
+                if not self._is_retryable_submission_error(exc) or attempt == ORDER_SUBMIT_ATTEMPTS - 1:
+                    raise
+                delay = ORDER_RETRY_DELAYS_SECONDS[attempt]
+                self.logger.warning("止损提交失败，第%s/%s次后核对重试 symbol=%s: %s", attempt + 1, ORDER_SUBMIT_ATTEMPTS, symbol, exc)
+                time.sleep(delay)
+        raise RuntimeError(f"止损提交失败:{last_error}")
+
+    def _submit_limit_order(
+        self,
+        client: BinanceFuturesClient,
+        symbol: str,
+        side: str,
+        price: Decimal,
+        quantity: Decimal,
+        position_side: str | None,
+        reduce_only: bool,
+    ) -> dict[str, Any]:
+        """用固定 clientOrderId 提交止盈限价单，异常时回查订单后有限重试。"""
+        client_order_id = f"bot-take-profit-{uuid.uuid4().hex[:18]}"
+        last_error: Exception | None = None
+        for attempt in range(ORDER_SUBMIT_ATTEMPTS):
+            try:
+                return client.place_limit_order(
+                    symbol, side, format(price, "f"), format(quantity, "f"),
+                    position_side, reduce_only, client_order_id,
+                )
+            except Exception as exc:
+                last_error = exc
+                try:
+                    existing = client.get_order_status(symbol, client_order_id=client_order_id)
+                    if existing:
+                        return existing
+                except Exception:
+                    pass
+                if not self._is_retryable_submission_error(exc) or attempt == ORDER_SUBMIT_ATTEMPTS - 1:
+                    raise
+                time.sleep(ORDER_RETRY_DELAYS_SECONDS[attempt])
+        raise RuntimeError(f"止盈单提交失败:{last_error}")
+
+    @staticmethod
+    def _find_open_stop_order(
+        client: BinanceFuturesClient,
+        symbol: str,
+        stop_side: str,
+        stop_price: Decimal,
+        position_side: str | None,
+    ) -> dict[str, Any] | None:
+        """在官方 openAlgoOrders 快照中匹配本次应提交的全平止损。"""
+        try:
+            candidates = client.get_open_algo_orders(symbol)
+        except Exception:
+            return None
+        for order in candidates:
+            trigger = _decimal(order.get("triggerPrice"))
+            if (
+                order.get("type") == "STOP_MARKET"
+                and order.get("side") == stop_side
+                and trigger == stop_price
+                and str(order.get("closePosition")).lower() == "true"
+                and (position_side is None or order.get("positionSide") == position_side)
+            ):
+                return order
+        return None
+
     def _close_position(
         self,
         client: BinanceFuturesClient,
@@ -805,7 +995,10 @@ class TradingExecutor:
             return "无法平仓(缺少有效数量),请手动处理"
         close_side = "SELL" if side == "BUY" else "BUY"
         try:
-            client.place_market_order(symbol, close_side, format(quantity, "f"), position_side, reduce_only)
+            close_client_order_id = f"bot-emergency-close-{uuid.uuid4().hex[:14]}"
+            self._submit_market_order(
+                client, symbol, close_side, format(quantity, "f"), position_side, reduce_only, close_client_order_id,
+            )
             return "已反向平仓"
         except Exception as exc:
             self.logger.error("反向平仓失败 symbol=%s: %s", symbol, exc)

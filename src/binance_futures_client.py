@@ -48,6 +48,7 @@ USER_TRADES_PATH = "/fapi/v1/userTrades"
 # 2025-12-09 起条件单(STOP_MARKET 等)强制迁移到 Algo Order API,旧端点返回 -4120
 # 官方文档:https://developers.binance.com/legacy-docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
 ALGO_ORDER_PATH = "/fapi/v1/algoOrder"
+OPEN_ALGO_ORDERS_PATH = "/fapi/v1/openAlgoOrders"
 # 用户数据流 listenKey 管理(官方文档:该组端点仅需 API Key,无需 HMAC 签名)
 LISTEN_KEY_PATH = "/fapi/v1/listenKey"
 # 官方文档:recvWindow 缺省 5000 毫秒,最大 60000
@@ -303,6 +304,15 @@ class BinanceFuturesClient:
         payload = self._signed_request("GET", ALGO_ORDER_PATH, {"symbol": symbol, "algoId": algo_id})
         return payload if isinstance(payload, dict) else {}
 
+    def get_open_algo_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """查询未触发的 Algo 订单，用于止损提交网络异常后的幂等核对。
+
+        官方文档：https://developers.binance.com/en/docs/llms-full.txt
+        （USDⓈ-M Futures: GET /fapi/v1/openAlgoOrders）。
+        """
+        payload = self._signed_request("GET", OPEN_ALGO_ORDERS_PATH, {"symbol": symbol})
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
     def get_position(self, symbol: str, position_side: str | None = None) -> dict[str, Any] | None:
         """查询指定交易对当前持仓记录(/fapi/v2/positionRisk?symbol=X)。
 
@@ -448,6 +458,7 @@ class BinanceFuturesClient:
         quantity: str,
         position_side: str | None = None,
         reduce_only: bool = True,
+        client_order_id: str | None = None,
     ) -> dict[str, Any]:
         """挂限价单(/fapi/v1/order,普通单不受条件单 Algo 迁移影响)。
 
@@ -467,6 +478,8 @@ class BinanceFuturesClient:
             params["positionSide"] = position_side
         if reduce_only:
             params["reduceOnly"] = "true"
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         payload = self._signed_request("POST", ORDER_PATH, params)
         return payload if isinstance(payload, dict) else {}
 

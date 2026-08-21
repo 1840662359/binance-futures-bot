@@ -8,7 +8,6 @@ GUI 展示层按北京时间日期聚合(见 beijing_date_key)。
 - symbol / signalType / direction / entryPrice / quantity / leverage:开仓信息
 - openTime / closeTime:开仓与平仓时间(毫秒)
 - realizedPnlUsdt / commissionUsdt / fundingFeeUsdt / netPnlUsdt:成交盈亏、手续费、资金费与净盈亏
-- closeReason:由程序订单 ID、条件单事件和成交事实确定的平仓原因
 """
 
 from __future__ import annotations

@@ -473,8 +473,11 @@ class PositionMonitor:
             return
         order_id = order.get("i") or order.get("orderId")
         client_order_id = order.get("c") or order.get("clientOrderId")
-        reason = "外部平仓"
-        evidence = "成交订单不属于已登记的程序止盈、止损或自动全平订单"
+        # 未匹配到本地订单 ID 不等于外部平仓：私有流可能在重连期间漏掉
+        # ALGO_UPDATE，触发止损产生的实际平仓订单也不复用止损 Algo ID。
+        # 先保留为待核实，清理时再以 REST 查询已登记止损/止盈的最终状态补证。
+        reason = "平仓原因待核实"
+        evidence = "成交订单暂未匹配本地订单 ID，等待权威订单状态核对"
         if str(order_id) == str(position.get("takeProfitOrderId")):
             reason, evidence = "程序止盈", "成交订单与程序登记的止盈订单 ID 一致"
         elif str(order_id) == str(position.get("autoCloseOrderId")) or (
@@ -767,7 +770,7 @@ class PositionMonitor:
                 stop_missing = isinstance(exc, BinanceFuturesError) and exc.code == -2011
                 self._log_cancel_outcome("止损", symbol, stop_algo_id, exc)
         try:
-            self._record_position_pnl(position, tp_missing, stop_missing)
+            self._record_position_pnl(position)
         except Exception as exc:
             self.logger.warning("平仓盈亏记录失败,保留本地记录待下轮重试 symbol=%s: %s", symbol, exc)
             return
@@ -775,8 +778,8 @@ class PositionMonitor:
         remove_lifecycle(self.config.environment, position_key(symbol, position.get("positionSide")))
         self.logger.info("幽灵持仓已清理 symbol=%s", symbol)
 
-    def _record_position_pnl(self, position: dict[str, Any], tp_missing: bool, stop_missing: bool) -> None:
-        """按程序仓位生命周期汇总最终平仓盈亏与原因。"""
+    def _record_position_pnl(self, position: dict[str, Any]) -> None:
+        """按程序仓位生命周期汇总最终平仓盈亏。"""
         symbol = str(position.get("symbol") or "")
         open_time = position.get("openTime")
         if not symbol:
@@ -784,9 +787,10 @@ class PositionMonitor:
         key = position_key(symbol, position.get("positionSide"))
         lifecycle = read_lifecycle(self.config.environment, key) or {}
         close_time = int(time.time() * 1000)
+        entry_order_id = position.get("entryOrderId") or lifecycle.get("entryOrderId")
         realized, commission, funding, commission_by_asset, exit_order_ids = self._query_lifecycle_pnl(
             symbol, open_time, close_time, str(position.get("direction") or ""),
-            str(position.get("positionSide") or "BOTH"),
+            str(position.get("positionSide") or "BOTH"), entry_order_id,
         )
         quantity = position.get("quantity")
         if quantity is None:
@@ -808,9 +812,7 @@ class PositionMonitor:
             "fundingFeeUsdt": funding,
             "commissionByAsset": commission_by_asset,
             "netPnlUsdt": realized + commission + funding,
-            "closeReason": self._resolve_close_reason(position, lifecycle, tp_missing, stop_missing),
-            "closeReasonEvidence": lifecycle.get("closeReasonEvidence"),
-            "entryOrderId": position.get("entryOrderId") or lifecycle.get("entryOrderId"),
+            "entryOrderId": entry_order_id,
             "exitOrderIds": exit_order_ids,
             "lifecycleEvents": lifecycle.get("events", []),
             "recordedAt": datetime.now(timezone.utc).isoformat(),
@@ -818,8 +820,8 @@ class PositionMonitor:
         append_pnl_record(self.config.environment, record)
         self._notify_close(record)
         self.logger.info(
-            "平仓盈亏已记录 symbol=%s net=%s 原因=%s",
-            symbol, record["netPnlUsdt"], record["closeReason"],
+            "平仓盈亏已记录 symbol=%s net=%s",
+            symbol, record["netPnlUsdt"],
         )
 
     def _notify_close(self, record: dict[str, Any]) -> None:
@@ -831,25 +833,37 @@ class PositionMonitor:
             direction = record.get("direction") or ""
             net = float(record.get("netPnlUsdt") or 0.0)
             commission = float(record.get("commissionUsdt") or 0.0)
-            reason = record.get("closeReason") or ""
             lines = [
                 f"**{symbol} 已平仓** 方向:{direction}",
                 f"- 净盈亏: {net:+.2f} USDT",
                 f"- 手续费: {commission:+.2f} USDT",
-                f"- 平仓原因: {reason}",
             ]
             push_message_async("Binance Futures Bot 平仓", "\n".join(lines))
         except Exception:
             self.logger.exception("平仓通知推送失败")
 
     def _query_lifecycle_pnl(
-        self, symbol: str, open_time: Any, close_time: int, direction: str, position_side: str
+        self,
+        symbol: str,
+        open_time: Any,
+        close_time: int,
+        direction: str,
+        position_side: str,
+        entry_order_id: Any = None,
     ) -> tuple[float, float, float, dict[str, float], list[int]]:
-        """只汇总本程序持仓从实际开仓到最终平仓期间的成交与资金费。"""
+        """按开仓订单 ID 与平仓方向汇总单个程序仓位的成交、费用和资金费。"""
         try:
-            start = int(open_time)
+            opened_at = int(open_time)
         except (TypeError, ValueError):
-            start = int(time.time() * 1000) - 7 * 86400_000
+            opened_at = int(time.time() * 1000) - 7 * 86400_000
+        # position.openTime 取开仓回报时间，可能比 userTrades 的实际成交时间晚数毫秒。
+        # 向前回溯一分钟只用于按 entryOrderId 找到开仓成交；其它成交仍须不早于 opened_at，
+        # 从而不会混入同交易对上一生命周期的平仓。
+        start = max(0, opened_at - 60_000)
+        try:
+            registered_entry_order_id = int(entry_order_id)
+        except (TypeError, ValueError):
+            registered_entry_order_id = None
         realized = 0.0
         commission = 0.0
         commission_by_asset: dict[str, float] = {}
@@ -887,9 +901,26 @@ class PositionMonitor:
             from_id = next_from_id
         else:
             self.logger.warning("盈亏成交分页达到安全上限 symbol=%s", symbol)
+        closing_side = "SELL" if direction == "多" else "BUY"
         for trade in trades:
             trade_side = str(trade.get("positionSide") or "BOTH")
             if position_side != "BOTH" and trade_side != position_side:
+                continue
+            try:
+                order_id = int(trade.get("orderId"))
+            except (TypeError, ValueError):
+                order_id = None
+            is_entry_trade = registered_entry_order_id is not None and order_id == registered_entry_order_id
+            try:
+                trade_time = int(trade.get("time", trade.get("T", 0)))
+            except (TypeError, ValueError):
+                trade_time = 0
+            is_closing_trade = str(trade.get("side") or "") == closing_side and (
+                registered_entry_order_id is None or trade_time >= opened_at
+            )
+            # 开仓成交仅认可已登记的 entryOrderId；平仓成交则认可开仓后实际发生的反向成交。
+            # 这同时修复开仓成交时间略早于 position.openTime 时遗漏开仓手续费的问题。
+            if registered_entry_order_id is not None and not (is_entry_trade or is_closing_trade):
                 continue
             try:
                 realized += float(trade.get("realizedPnl", 0.0))
@@ -900,15 +931,13 @@ class PositionMonitor:
                 fee = float(trade.get("commission", 0.0))
             except (TypeError, ValueError):
                 fee = 0.0
-            commission_by_asset[asset] = commission_by_asset.get(asset, 0.0) + fee
+            # userTrades 的 commission 是手续费金额而非盈亏方向；测试网与部分
+            # 响应会返回正数，统一转为负支出后再计入净盈亏。
+            fee_expense = -abs(fee)
+            commission_by_asset[asset] = commission_by_asset.get(asset, 0.0) + fee_expense
             if asset == "USDT":
-                commission += fee
-            closing_side = "SELL" if direction == "多" else "BUY"
-            if str(trade.get("side") or "") == closing_side:
-                try:
-                    order_id = int(trade.get("orderId"))
-                except (TypeError, ValueError):
-                    continue
+                commission += fee_expense
+            if is_closing_trade and order_id is not None:
                 if order_id not in exit_order_ids:
                     exit_order_ids.append(order_id)
         # 用户成交明细暂不可用时，回退收入历史；仍仅由已登记程序仓位触发。
@@ -916,9 +945,9 @@ class PositionMonitor:
             for item in self._income_pages(symbol, start, close_time, "REALIZED_PNL"):
                 realized += _safe_float(item.get("income"))
             for item in self._income_pages(symbol, start, close_time, "COMMISSION"):
-                fee = _safe_float(item.get("income"))
-                commission += fee
-                commission_by_asset["USDT"] = commission_by_asset.get("USDT", 0.0) + fee
+                fee_expense = -abs(_safe_float(item.get("income")))
+                commission += fee_expense
+                commission_by_asset["USDT"] = commission_by_asset.get("USDT", 0.0) + fee_expense
         # funding fee 不会出现在 userTrades，单独以收入历史补入。
         funding = sum(
             _safe_float(item.get("income"))
@@ -942,7 +971,8 @@ class PositionMonitor:
     ) -> str:
         """按已持久化的程序订单事实优先确定原因，REST 状态只作断流恢复。"""
         reason = lifecycle.get("closeReason")
-        if reason in {"程序止盈", "程序止损", "程序盈亏全平", "外部平仓"}:
+        # 仅接受有程序订单事实的强结论；“外部平仓/待核实”必须继续 REST 补证。
+        if reason in {"程序止盈", "程序止损", "程序盈亏全平"}:
             return str(reason)
         symbol = str(position.get("symbol") or "")
         if position.get("autoCloseOrderId") or position.get("autoCloseClientOrderId"):
@@ -967,7 +997,7 @@ class PositionMonitor:
                     self.logger.warning("止损单状态查询失败 symbol=%s: %s", symbol, exc)
             except Exception as exc:
                 self.logger.warning("止损单状态查询失败 symbol=%s: %s", symbol, exc)
-        return "外部平仓"
+        return "平仓原因待核实"
 
     def _ledger_quantity(self, symbol: str, open_time: Any) -> float | None:
         """从订单台账回查开仓数量(旧持仓记录未落库 quantity 时的兜底)。"""
